@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Company Brain</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 720px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
+  h1 { margin-bottom: 20px; color: #333; }
+  #chat { background: #fff; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); padding: 16px; min-height: 400px; max-height: 600px; overflow-y: auto; margin-bottom: 16px; }
+  .msg { margin-bottom: 16px; }
+  .msg.user { text-align: right; }
+  .msg.user .bubble { background: #007aff; color: #fff; }
+  .msg.assistant .bubble { background: #e9e9eb; color: #000; }
+  .bubble { display: inline-block; padding: 10px 14px; border-radius: 18px; max-width: 80%; text-align: left; white-space: pre-wrap; }
+  .sources { font-size: 0.85em; color: #666; margin-top: 4px; }
+  .sources a { color: #007aff; text-decoration: none; }
+  .sources a:hover { text-decoration: underline; }
+  .confirm-box { background: #fff8e1; border: 1px solid #ffe082; border-radius: 8px; padding: 12px 16px; margin-top: 8px; }
+  .confirm-box .desc { margin-bottom: 10px; font-size: 0.95em; }
+  .confirm-box .desc strong { color: #333; }
+  .confirm-box .btns { display: flex; gap: 8px; }
+  .confirm-box .btns button { padding: 6px 18px; border: none; border-radius: 6px; font-size: 0.9em; cursor: pointer; }
+  .btn-confirm { background: #34c759; color: #fff; }
+  .btn-confirm:hover { opacity: 0.9; }
+  .btn-decline { background: #ff3b30; color: #fff; }
+  .btn-decline:hover { opacity: 0.9; }
+  #input-row { display: flex; gap: 8px; }
+  #input-row input { flex: 1; padding: 10px 14px; border: 1px solid #ccc; border-radius: 20px; font-size: 1em; outline: none; }
+  #input-row input:focus { border-color: #007aff; }
+  #input-row button { padding: 10px 20px; background: #007aff; color: #fff; border: none; border-radius: 20px; font-size: 1em; cursor: pointer; }
+  #input-row button:disabled { opacity: 0.6; cursor: not-allowed; }
+  .error { color: #d32f2f; }
+</style>
+</head>
+<body>
+<h1>Company Brain</h1>
+<div id="chat"></div>
+<div id="input-row">
+  <input type="text" id="question" placeholder="Ask a question about your documents..." autofocus>
+  <button id="send-btn">Send</button>
+</div>
+<script>
+  const chatEl = document.getElementById('chat');
+  const inputEl = document.getElementById('question');
+  const sendBtn = document.getElementById('send-btn');
+
+  let conversationId = null;
+  let awaitingConfirm = false;
+
+  function addMessage(role, text, sources, confirmData) {
+    const div = document.createElement('div');
+    div.className = 'msg ' + role;
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble';
+    bubble.textContent = text || (role === 'assistant' ? '' : '');
+    if (text) div.appendChild(bubble);
+
+    if (confirmData) {
+      const box = document.createElement('div');
+      box.className = 'confirm-box';
+      box.innerHTML = `<div class="desc"><strong>Proposed action:</strong> ${escapeHtml(confirmData.description)}</div>`;
+      const btns = document.createElement('div');
+      btns.className = 'btns';
+      const confirmBtn = document.createElement('button');
+      confirmBtn.className = 'btn-confirm';
+      confirmBtn.textContent = 'Confirm';
+      confirmBtn.addEventListener('click', () => sendConfirm(true));
+      const declineBtn = document.createElement('button');
+      declineBtn.className = 'btn-decline';
+      declineBtn.textContent = 'Decline';
+      declineBtn.addEventListener('click', () => sendConfirm(false));
+      btns.appendChild(confirmBtn);
+      btns.appendChild(declineBtn);
+      box.appendChild(btns);
+      div.appendChild(box);
+    }
+
+    if (sources && sources.length > 0) {
+      const srcDiv = document.createElement('div');
+      srcDiv.className = 'sources';
+      srcDiv.textContent = 'Sources: ';
+      sources.forEach((s, i) => {
+        const a = document.createElement('a');
+        a.href = s.url || '#';
+        a.target = '_blank';
+        a.textContent = s.name + (s.type ? ' (' + s.type + ')' : '');
+        srcDiv.appendChild(a);
+        if (i < sources.length - 1) srcDiv.appendChild(document.createTextNode(', '));
+      });
+      div.appendChild(srcDiv);
+    }
+    chatEl.appendChild(div);
+    chatEl.scrollTop = chatEl.scrollHeight;
+  }
+
+  function escapeHtml(text) {
+    const d = document.createElement('div');
+    d.textContent = text;
+    return d.innerHTML;
+  }
+
+  async function sendMessage(text) {
+    const body = { message: text };
+    if (conversationId) body.conversation_id = conversationId;
+    const res = await fetch('/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error('Request failed');
+    return res.json();
+  }
+
+  async function sendConfirm(approved) {
+    if (!conversationId) return;
+    awaitingConfirm = false;
+    sendBtn.disabled = true;
+    sendBtn.textContent = '...';
+    try {
+      const res = await fetch('/chat/confirm', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ conversation_id: conversationId, approved }),
+      });
+      if (!res.ok) throw new Error('Request failed');
+      const data = await res.json();
+      handleResponse(data);
+    } catch (err) {
+      addMessage('assistant', 'Error: ' + err.message, null);
+    } finally {
+      sendBtn.disabled = false;
+      sendBtn.textContent = 'Send';
+      inputEl.focus();
+    }
+  }
+
+  function handleResponse(data) {
+    if (data.type === 'confirmation_required') {
+      conversationId = data.conversation_id;
+      awaitingConfirm = true;
+      const text = data.explanation || 'I would like to perform the following action:';
+      addMessage('assistant', text, null, { description: data.description });
+      return;
+    }
+    if (data.type === 'message') {
+      conversationId = data.conversation_id;
+      addMessage('assistant', data.answer, data.sources, null);
+      return;
+    }
+    if (data.error) {
+      addMessage('assistant', 'Error: ' + data.error, null);
+    }
+  }
+
+  async function send() {
+    const question = inputEl.value.trim();
+    if (!question || awaitingConfirm) return;
+    addMessage('user', question);
+    inputEl.value = '';
+    sendBtn.disabled = true;
+    sendBtn.textContent = '...';
+    try {
+      const data = await sendMessage(question);
+      handleResponse(data);
+    } catch (err) {
+      addMessage('assistant', 'Error: ' + err.message, null);
+    } finally {
+      sendBtn.disabled = false;
+      sendBtn.textContent = 'Send';
+      inputEl.focus();
+    }
+  }
+
+  sendBtn.addEventListener('click', send);
+  inputEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') send(); });
+</script>
+</body>
+</html>
