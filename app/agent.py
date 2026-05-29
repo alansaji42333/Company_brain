@@ -1,6 +1,7 @@
 import uuid
 import logging
-from typing import Any
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 from anthropic import Anthropic
 from app.config import (
     ANTHROPIC_API_KEY, CLAUDE_MODEL, CLAUDE_MAX_TOKENS_AGENT,
@@ -8,15 +9,11 @@ from app.config import (
 )
 from app.vectorstore import query_both
 from app.tools import TOOL_SCHEMAS, describe_tool_call, execute_tool
+from app.database import Conversation, Message
 
 logger = logging.getLogger(__name__)
 
 _client: Anthropic | None = None
-
-# In-memory conversation state — will not survive a restart.
-# Keyed by conversation_id (UUID string).
-# Each value: {"messages": [...], "pending_action": dict | None}
-_conversations: dict[str, dict[str, Any]] = {}
 
 
 def _get_client() -> Anthropic:
@@ -26,8 +23,8 @@ def _get_client() -> Anthropic:
     return _client
 
 
-def _build_context(question: str) -> tuple[str, list[dict]]:
-    results = query_both(question, top_k=TOP_K_RETRIEVAL)
+def _build_context(question: str, user_id: str | None = None) -> tuple[str, list[dict]]:
+    results = query_both(question, top_k=TOP_K_RETRIEVAL, user_id=user_id)
     raw_chunks = results["raw"]
     skill_chunks = results["skills"]
 
@@ -92,25 +89,52 @@ def _build_system_prompt(context: str) -> str:
     )
 
 
-def _create_conversation() -> str:
-    cid = str(uuid.uuid4())
-    _conversations[cid] = {"messages": [], "pending_action": None}
-    return cid
+async def _load_messages(db: AsyncSession, conversation_id: str) -> list[dict]:
+    result = await db.execute(
+        select(Message).where(Message.conversation_id == conversation_id).order_by(Message.created_at)
+    )
+    messages = result.scalars().all()
+    return [{"role": m.role, "content": m.content} for m in messages]
 
 
-def send_message(conversation_id: str | None, message: str) -> dict:
-    if conversation_id and conversation_id in _conversations:
-        state = _conversations[conversation_id]
+async def _save_user_message(db: AsyncSession, conversation_id: str, content: str):
+    msg = Message(conversation_id=conversation_id, role="user", content=content)
+    db.add(msg)
+    await db.commit()
+
+
+async def _save_assistant_message(db: AsyncSession, conversation_id: str, content: list):
+    msg = Message(conversation_id=conversation_id, role="assistant", content=content)
+    db.add(msg)
+    await db.commit()
+
+
+async def _save_tool_result(db: AsyncSession, conversation_id: str, tool_result_block: dict):
+    msg = Message(conversation_id=conversation_id, role="user", content=[tool_result_block])
+    db.add(msg)
+    await db.commit()
+
+
+async def send_message(conversation_id: str | None, message: str, db: AsyncSession, user_id: str | None = None) -> dict:
+    if conversation_id:
+        result = await db.execute(select(Conversation).where(Conversation.id == conversation_id))
+        conv = result.scalar_one_or_none()
     else:
-        cid = _create_conversation()
-        state = _conversations[cid]
-        conversation_id = cid
+        conv = None
 
-    state["pending_action"] = None
+    if conv is None:
+        conversation_id = str(uuid.uuid4())
+        conv = Conversation(id=conversation_id)
+        db.add(conv)
+        await db.commit()
 
-    state["messages"].append({"role": "user", "content": message})
+    conv.pending_action = None
+    await db.commit()
 
-    context, sources = _build_context(message)
+    await _save_user_message(db, conversation_id, message)
+
+    history = await _load_messages(db, conversation_id)
+    context, sources = _build_context(message, user_id=user_id)
     system_prompt = _build_system_prompt(context)
 
     client = _get_client()
@@ -118,59 +142,61 @@ def send_message(conversation_id: str | None, message: str) -> dict:
         model=CLAUDE_MODEL,
         max_tokens=CLAUDE_MAX_TOKENS_AGENT,
         system=system_prompt,
-        messages=state["messages"],
+        messages=history,
         tools=TOOL_SCHEMAS,
     )
 
-    return _process_response(response, state, conversation_id, sources)
+    return await _process_response(response, conv, db, conversation_id, sources)
 
 
-def confirm_action(conversation_id: str, approved: bool) -> dict:
-    state = _conversations.get(conversation_id)
-    if not state:
+async def confirm_action(conversation_id: str, approved: bool, db: AsyncSession, user_id: str | None = None) -> dict:
+    result = await db.execute(select(Conversation).where(Conversation.id == conversation_id))
+    conv = result.scalar_one_or_none()
+    if not conv:
         return {"error": "Conversation not found"}
 
-    pending = state.get("pending_action")
+    pending = conv.pending_action
     if not pending:
         return {"error": "No pending action to confirm"}
 
-    state["pending_action"] = None
+    conv.pending_action = None
+    await db.commit()
+
     tool_block = pending["tool_use_block"]
     tool_name = tool_block["name"]
     tool_input = tool_block["input"]
     tool_use_id = tool_block["id"]
 
-    context, sources = _build_context("")
+    context, sources = _build_context("", user_id=user_id)
     system_prompt = _build_system_prompt(context)
 
     if approved:
         logger.info("Executing tool: %s", tool_name)
-        result = execute_tool(tool_name, tool_input)
+        tool_result = execute_tool(tool_name, tool_input)
         tool_result_content = (
-            f"Result: {result.get('message', '')}"
-            if result.get("success")
-            else f"Error: {result.get('error', 'Unknown error')}"
+            f"Result: {tool_result.get('message', '')}"
+            if tool_result.get("success")
+            else f"Error: {tool_result.get('error', 'Unknown error')}"
         )
-        is_error = not result.get("success")
+        is_error = not tool_result.get("success")
     else:
         logger.info("User declined tool: %s", tool_name)
         tool_result_content = "The user declined this action."
         is_error = True
 
-    state["messages"].append({
-        "role": "user",
-        "content": [{
-            "type": "tool_result",
-            "tool_use_id": tool_use_id,
-            "content": tool_result_content,
-            "is_error": is_error,
-        }],
-    })
+    tool_result_block = {
+        "type": "tool_result",
+        "tool_use_id": tool_use_id,
+        "content": tool_result_content,
+        "is_error": is_error,
+    }
 
-    return _continue(state, conversation_id, sources, iteration=0)
+    await _save_tool_result(db, conversation_id, tool_result_block)
+
+    return await _continue(conv, db, conversation_id, sources, iteration=0, user_id=user_id)
 
 
-def _continue(state: dict, conversation_id: str, sources: list[dict], iteration: int) -> dict:
+async def _continue(conv: Conversation, db: AsyncSession, conversation_id: str, sources: list[dict], iteration: int, user_id: str | None = None) -> dict:
     if iteration > AGENT_MAX_ITERATIONS:
         return {
             "type": "message",
@@ -179,43 +205,52 @@ def _continue(state: dict, conversation_id: str, sources: list[dict], iteration:
             "sources": sources,
         }
 
-    context, _ = _build_context("")
+    context, _ = _build_context("", user_id=user_id)
     system_prompt = _build_system_prompt(context)
+    history = await _load_messages(db, conversation_id)
 
     client = _get_client()
     response = client.messages.create(
         model=CLAUDE_MODEL,
         max_tokens=CLAUDE_MAX_TOKENS_AGENT,
         system=system_prompt,
-        messages=state["messages"],
+        messages=history,
         tools=TOOL_SCHEMAS,
     )
 
-    return _process_response(response, state, conversation_id, sources)
+    return await _process_response(response, conv, db, conversation_id, sources)
 
 
-def _process_response(response, state: dict, conversation_id: str, sources: list[dict]) -> dict:
-    text_parts = []
-    tool_use_block = None
+async def _process_response(response, conv: Conversation, db: AsyncSession, conversation_id: str, sources: list[dict]) -> dict:
+    content_blocks = []
 
     for block in response.content:
         if block.type == "text":
-            text_parts.append(block.text)
+            content_blocks.append({"type": "text", "text": block.text})
         elif block.type == "tool_use":
-            tool_use_block = {
+            content_blocks.append({
+                "type": "tool_use",
                 "id": block.id,
                 "name": block.name,
                 "input": block.input,
-            }
+            })
 
-    answer = "\n".join(text_parts)
+    answer = "\n".join(
+        b["text"] for b in content_blocks if b["type"] == "text"
+    )
 
-    if tool_use_block:
+    has_tool_use = any(b["type"] == "tool_use" for b in content_blocks)
+
+    if has_tool_use:
+        await _save_assistant_message(db, conversation_id, content_blocks)
+
+        tool_use_block = next(b for b in content_blocks if b["type"] == "tool_use")
         tool_name = tool_use_block["name"]
         tool_input = tool_use_block["input"]
         description = describe_tool_call(tool_name, tool_input)
 
-        state["pending_action"] = {"tool_use_block": tool_use_block}
+        conv.pending_action = {"tool_use_block": tool_use_block}
+        await db.commit()
 
         return {
             "type": "confirmation_required",
@@ -226,10 +261,8 @@ def _process_response(response, state: dict, conversation_id: str, sources: list
             "explanation": answer,
         }
 
-    state["messages"].append({
-        "role": "assistant",
-        "content": [{"type": "text", "text": answer}] if answer else [],
-    })
+    assistant_content = content_blocks if content_blocks else []
+    await _save_assistant_message(db, conversation_id, assistant_content)
 
     return {
         "type": "message",

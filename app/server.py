@@ -1,13 +1,21 @@
 import os
 import logging
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.database import get_db
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Company Brain")
+
+
+def get_user_id(x_user_id: str | None = Header(None)) -> str:
+    if not x_user_id:
+        raise HTTPException(status_code=401, detail="X-User-Id header is required")
+    return x_user_id
 
 
 class ChatRequest(BaseModel):
@@ -41,12 +49,12 @@ def skills_page():
 
 
 @app.post("/ingest")
-def ingest(folder_id: str | None = None):
+def ingest(folder_id: str | None = None, user_id: str = Depends(get_user_id)):
     from app.drive_ingest import ingest_drive_folder
     from app.chunking import chunk_documents
     from app.vectorstore import add_chunks
 
-    documents = ingest_drive_folder(folder_id)
+    documents = ingest_drive_folder(folder_id, user_id=user_id)
     chunks = chunk_documents(documents)
     add_chunks(chunks)
 
@@ -58,11 +66,11 @@ def ingest(folder_id: str | None = None):
 
 
 @app.post("/ingest/slack")
-def ingest_slack():
+def ingest_slack(user_id: str = Depends(get_user_id)):
     from app.slack_ingest import ingest_slack as run_ingest
     from app.vectorstore import add_chunks
 
-    chunks = run_ingest()
+    chunks = run_ingest(user_id=user_id)
     add_chunks(chunks)
 
     return {
@@ -72,10 +80,10 @@ def ingest_slack():
 
 
 @app.post("/synthesize")
-def synthesize():
+def synthesize(user_id: str = Depends(get_user_id)):
     from app.skill_synthesis import synthesize as run_synthesis
 
-    summary = run_synthesis()
+    summary = run_synthesis(user_id=user_id)
     return {"status": "ok", **summary}
 
 
@@ -122,14 +130,14 @@ def reject_skill(skill_id: str):
 
 
 @app.post("/chat")
-def chat(req: ChatRequest):
+async def chat(req: ChatRequest, db: AsyncSession = Depends(get_db), user_id: str = Depends(get_user_id)):
     from app.agent import send_message
-    result = send_message(req.conversation_id, req.message)
+    result = await send_message(req.conversation_id, req.message, db, user_id=user_id)
     return result
 
 
 @app.post("/chat/confirm")
-def chat_confirm(req: ConfirmRequest):
+async def chat_confirm(req: ConfirmRequest, db: AsyncSession = Depends(get_db), user_id: str = Depends(get_user_id)):
     from app.agent import confirm_action
-    result = confirm_action(str(req.conversation_id), req.approved)
+    result = await confirm_action(str(req.conversation_id), req.approved, db, user_id=user_id)
     return result

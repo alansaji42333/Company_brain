@@ -50,14 +50,19 @@ def add_chunks(chunks: list[dict], collection: str = COLLECTION_NAME):
     logger.info("Stored %d chunk(s) in %s", len(chunks), collection)
 
 
-def query(question: str, top_k: int | None = None, collection: str = COLLECTION_NAME) -> list[dict]:
+def query(question: str, top_k: int | None = None, collection: str = COLLECTION_NAME, user_id: str | None = None) -> list[dict]:
     col = _get_collection(collection)
     k = top_k or TOP_K_RETRIEVAL
     [question_embedding] = embed([question])
 
+    where_filter = None
+    if user_id:
+        where_filter = {"user_id": user_id}
+
     results = col.query(
         query_embeddings=[question_embedding],
         n_results=k,
+        where=where_filter,
         include=["documents", "metadatas", "distances"],
     )
 
@@ -73,10 +78,10 @@ def query(question: str, top_k: int | None = None, collection: str = COLLECTION_
     return chunks
 
 
-def query_both(question: str, top_k: int | None = None) -> dict:
+def query_both(question: str, top_k: int | None = None, user_id: str | None = None) -> dict:
     k = top_k or TOP_K_RETRIEVAL
-    raw_chunks = query(question, top_k=k, collection=COLLECTION_NAME)
-    skill_chunks = query(question, top_k=TOP_K_SKILLS, collection=COLLECTION_SKILLS)
+    raw_chunks = query(question, top_k=k, collection=COLLECTION_NAME, user_id=user_id)
+    skill_chunks = query(question, top_k=TOP_K_SKILLS, collection=COLLECTION_SKILLS, user_id=user_id)
     return {"raw": raw_chunks, "skills": skill_chunks}
 
 

@@ -10,3 +10,6 @@ tiktoken>=0.8.0
 python-dotenv==1.0.1
 slack_sdk>=3.0.0
 python-frontmatter>=1.1.0
+sqlalchemy[asyncio]>=2.0.0
+asyncpg>=0.29.0
+alembic>=1.13.0

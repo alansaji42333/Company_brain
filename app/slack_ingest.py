@@ -180,6 +180,7 @@ def conversation_to_chunks(
     channel_id: str,
     channel_name: str,
     window_id: str,
+    user_id: str = "",
 ) -> list[dict]:
     dialogue = _format_dialogue(conversation, channel_name)
     first_ts = conversation[0].get("ts", "0")
@@ -197,6 +198,7 @@ def conversation_to_chunks(
             "source_type": "slack",
             "channel_name": channel_name,
             "ingested_at": ingested_at,
+            "user_id": user_id,
         }]
 
     doc = {
@@ -204,6 +206,7 @@ def conversation_to_chunks(
         "name": f"#{channel_name}",
         "source_url": permalink,
         "text": dialogue,
+        "user_id": user_id,
     }
     sub_chunks = chunk_document(doc)
     for c in sub_chunks:
@@ -215,7 +218,7 @@ def conversation_to_chunks(
     return sub_chunks
 
 
-def ingest_slack_channel(channel_id: str) -> list[dict]:
+def ingest_slack_channel(channel_id: str, user_id: str = "") -> list[dict]:
     channel_name = _get_channel_name(channel_id)
     logger.info("Fetching messages for #%s (%s)", channel_name, channel_id)
 
@@ -253,14 +256,14 @@ def ingest_slack_channel(channel_id: str) -> list[dict]:
     all_chunks = []
     for conv in conversations:
         window_id = _build_window_id(conv)
-        chunks = conversation_to_chunks(conv, channel_id, channel_name, window_id)
+        chunks = conversation_to_chunks(conv, channel_id, channel_name, window_id, user_id=user_id)
         all_chunks.extend(chunks)
 
     logger.info("Created %d chunk(s) from #%s", len(all_chunks), channel_name)
     return all_chunks
 
 
-def ingest_slack() -> list[dict]:
+def ingest_slack(user_id: str = "") -> list[dict]:
     channel_ids_str = SLACK_CHANNEL_IDS
     if not channel_ids_str:
         raise ValueError("SLACK_CHANNEL_IDS must be set in .env")
@@ -272,7 +275,7 @@ def ingest_slack() -> list[dict]:
     all_chunks = []
     for cid in channel_ids:
         try:
-            chunks = ingest_slack_channel(cid)
+            chunks = ingest_slack_channel(cid, user_id=user_id)
             all_chunks.extend(chunks)
         except Exception as e:
             logger.error("Failed to ingest channel %s: %s", cid, e)

@@ -35,11 +35,15 @@ def _write_last_synthesis_at(timestamp: str):
         f.write(timestamp)
 
 
-def _fetch_new_chunks(last_synthesis_at: str | None) -> list[dict]:
+def _fetch_new_chunks(last_synthesis_at: str | None, user_id: str | None = None) -> list[dict]:
     col = _get_collection(COLLECTION_NAME)
     where = None
-    if last_synthesis_at:
+    if last_synthesis_at and user_id:
+        where = {"$and": [{"ingested_at": {"$gt": last_synthesis_at}}, {"user_id": user_id}]}
+    elif last_synthesis_at:
         where = {"ingested_at": {"$gt": last_synthesis_at}}
+    elif user_id:
+        where = {"user_id": user_id}
 
     offset = 0
     limit = 1000
@@ -130,9 +134,9 @@ def _synthesize_batch(batch: list[dict]) -> list[dict]:
     return procedures
 
 
-def synthesize() -> dict:
+def synthesize(user_id: str | None = None) -> dict:
     last_at = _read_last_synthesis_at()
-    chunks = _fetch_new_chunks(last_at)
+    chunks = _fetch_new_chunks(last_at, user_id=user_id)
 
     if not chunks:
         logger.info("No new chunks since last synthesis (or first run with no data)")

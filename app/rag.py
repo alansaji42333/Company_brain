@@ -15,8 +15,8 @@ def _get_client() -> Anthropic:
     return _client
 
 
-def answer_question(question: str) -> dict:
-    results = query_both(question, top_k=TOP_K_RETRIEVAL)
+def answer_question(question: str, user_id: str | None = None) -> dict:
+    results = query_both(question, top_k=TOP_K_RETRIEVAL, user_id=user_id)
     raw_chunks = results["raw"]
     skill_chunks = results["skills"]
 

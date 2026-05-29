@@ -1,0 +1,16 @@
+.venv/
+.venv
+venv/
+venv
+.git/
+.git
+__pycache__/
+*.pyc
+.DS_Store
+.env
+credentials.json
+token.json
+README.md
+README2.md
+PROJECT_CONTEXT.md
+.gitignore

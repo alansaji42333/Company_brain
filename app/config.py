@@ -9,6 +9,7 @@ SLACK_BOT_TOKEN: str = os.getenv("SLACK_BOT_TOKEN", "")
 SLACK_CHANNEL_IDS: str = os.getenv("SLACK_CHANNEL_IDS", "")
 GOOGLE_SHEET_ID: str = os.getenv("GOOGLE_SHEET_ID", "")
 GOOGLE_SHEET_TAB: str = os.getenv("GOOGLE_SHEET_TAB", "Sheet1")
+DATABASE_URL: str = os.getenv("DATABASE_URL", "postgresql+asyncpg://company_brain:company_brain@db:5432/company_brain")
 
 CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", "500"))
 CHUNK_OVERLAP: int = int(os.getenv("CHUNK_OVERLAP", "50"))

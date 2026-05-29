@@ -1,0 +1,9 @@
+#!/bin/bash
+# Docker entrypoint: apply pending migrations then start the server.
+set -euo pipefail
+
+echo "=== Running database migrations ==="
+alembic upgrade head
+
+echo "=== Starting uvicorn ==="
+exec uvicorn app.server:app --host 0.0.0.0 --port 8000

@@ -103,7 +103,7 @@ def extract_text(file_info: dict, service) -> Document | None:
     }
 
 
-def ingest_drive_folder(folder_id: str | None = None) -> list[Document]:
+def ingest_drive_folder(folder_id: str | None = None, user_id: str = "") -> list[Document]:
     from app.config import GOOGLE_DRIVE_FOLDER_ID
     folder_id = folder_id or GOOGLE_DRIVE_FOLDER_ID
     if not folder_id:
@@ -117,6 +117,7 @@ def ingest_drive_folder(folder_id: str | None = None) -> list[Document]:
     for f in files:
         doc = extract_text(f, service)
         if doc is not None:
+            doc["user_id"] = user_id
             documents.append(doc)
 
     logger.info("Successfully extracted %d document(s)", len(documents))
