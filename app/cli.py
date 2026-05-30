@@ -11,15 +11,9 @@ def cmd_ingest(args):
     from app.chunking import chunk_documents
     from app.vectorstore import add_chunks
 
-    folder_id = args.folder_id
-    logger.info("Starting ingestion from Drive folder: %s", folder_id or "(from .env)")
-
-    documents = ingest_drive_folder(folder_id)
-    logger.info("Extracted %d document(s)", len(documents))
-
-    chunks = chunk_documents(documents)
-    logger.info("Created %d chunk(s)", len(chunks))
-
+    user_id = args.user_id or "cli"
+    documents = ingest_drive_folder(args.folder_id, user_id=user_id)
+    chunks = chunk_documents(documents, user_id=user_id)
     add_chunks(chunks)
     logger.info("Ingestion complete — %d chunk(s) stored", len(chunks))
 
@@ -28,10 +22,8 @@ def cmd_ingest_slack(args):
     from app.slack_ingest import ingest_slack
     from app.vectorstore import add_chunks
 
-    logger.info("Starting Slack ingestion...")
-    chunks = ingest_slack()
-    logger.info("Created %d Slack chunk(s)", len(chunks))
-
+    user_id = args.user_id or "cli"
+    chunks = ingest_slack(user_id=user_id)
     add_chunks(chunks)
     logger.info("Slack ingestion complete — %d chunk(s) stored", len(chunks))
 
@@ -39,13 +31,11 @@ def cmd_ingest_slack(args):
 def cmd_synthesize(args):
     from app.skill_synthesis import synthesize
 
-    logger.info("Starting skill synthesis...")
-    summary = synthesize()
+    user_id = args.user_id or "cli"
+    summary = synthesize(user_id=user_id)
     logger.info(
-        "Synthesis complete — %d batch(es) processed, %d new skill(s), %d skipped duplicate(s)",
-        summary["batches_processed"],
-        summary["new_skills"],
-        summary["skipped_duplicates"],
+        "Synthesis complete — %d batch(es), %d new skill(s), %d skipped",
+        summary["batches_processed"], summary["new_skills"], summary["skipped_duplicates"],
     )
 
 
@@ -57,7 +47,8 @@ def cmd_ask(args):
         logger.error("Please provide a question.")
         sys.exit(1)
 
-    result = answer_question(question)
+    user_id = args.user_id or "cli"
+    result = answer_question(question, user_id=user_id)
     print(f"\nAnswer:\n{result['answer']}\n")
     if result["sources"]:
         print("Sources:")
@@ -74,16 +65,20 @@ def main():
 
     ingest_parser = subparsers.add_parser("ingest", help="Ingest documents from Google Drive")
     ingest_parser.add_argument("--folder-id", help="Override the folder ID from .env")
+    ingest_parser.add_argument("--user-id", default="cli", help="User ID for multi-tenant isolation")
     ingest_parser.set_defaults(func=cmd_ingest)
 
     ingest_slack_parser = subparsers.add_parser("ingest-slack", help="Ingest messages from Slack")
+    ingest_slack_parser.add_argument("--user-id", default="cli", help="User ID for multi-tenant isolation")
     ingest_slack_parser.set_defaults(func=cmd_ingest_slack)
 
     synthesize_parser = subparsers.add_parser("synthesize", help="Run skill synthesis on ingested content")
+    synthesize_parser.add_argument("--user-id", default="cli", help="User ID for multi-tenant isolation")
     synthesize_parser.set_defaults(func=cmd_synthesize)
 
     ask_parser = subparsers.add_parser("ask", help="Ask a question about your documents")
     ask_parser.add_argument("question", nargs="?", help="Your question")
+    ask_parser.add_argument("--user-id", default="cli", help="User ID for multi-tenant isolation")
     ask_parser.set_defaults(func=cmd_ask)
 
     args = parser.parse_args()

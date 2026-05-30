@@ -3,7 +3,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
 GOOGLE_DRIVE_FOLDER_ID: str = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "")
 SLACK_BOT_TOKEN: str = os.getenv("SLACK_BOT_TOKEN", "")
 SLACK_CHANNEL_IDS: str = os.getenv("SLACK_CHANNEL_IDS", "")
@@ -22,10 +21,12 @@ CHROMA_DIR: str = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(_
 COLLECTION_NAME: str = "company_docs"
 COLLECTION_SKILLS: str = "skill_docs"
 
-CLAUDE_MODEL: str = "claude-sonnet-4-6"
-CLAUDE_MAX_TOKENS: int = 1024
-CLAUDE_MAX_TOKENS_SYNTHESIS: int = 4096
-CLAUDE_MAX_TOKENS_AGENT: int = 2048
+OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "https://ollama.com/api")
+OLLAMA_API_KEY: str = os.getenv("OLLAMA_API_KEY", "")
+LLM_MODEL: str = os.getenv("LLM_MODEL", "llama3.1:8b")
+LLM_TIMEOUT: float = float(os.getenv("LLM_TIMEOUT", "120"))
+LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", "2048"))
+LLM_MAX_TOKENS_SYNTHESIS: int = int(os.getenv("LLM_MAX_TOKENS_SYNTHESIS", "4096"))
 
 CREDENTIALS_FILE: str = "credentials.json"
 TOKEN_FILE: str = "token.json"
@@ -41,3 +42,23 @@ LAST_SYNTHESIS_FILE: str = os.path.join(os.path.dirname(os.path.dirname(os.path.
 SLACK_CONVERSATION_WINDOW_MINUTES: int = 15
 
 AGENT_MAX_ITERATIONS: int = 5
+
+JWT_SECRET: str = os.getenv("JWT_SECRET", "")
+JWT_ALGORITHM: str = os.getenv("JWT_ALGORITHM", "HS256")
+JWT_EXPIRE_HOURS: int = int(os.getenv("JWT_EXPIRE_HOURS", "24"))
+CORS_ORIGINS: str = os.getenv("CORS_ORIGINS", "*")
+RATE_LIMIT: str = os.getenv("RATE_LIMIT", "30/minute")
+
+
+def validate_config():
+    missing = []
+    if not DATABASE_URL:
+        missing.append("DATABASE_URL")
+    if not OLLAMA_BASE_URL:
+        missing.append("OLLAMA_BASE_URL")
+    if not OLLAMA_API_KEY:
+        missing.append("OLLAMA_API_KEY")
+    if not LLM_MODEL:
+        missing.append("LLM_MODEL")
+    if missing:
+        raise RuntimeError(f"Missing required config: {', '.join(missing)}")

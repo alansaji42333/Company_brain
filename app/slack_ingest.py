@@ -1,7 +1,5 @@
-import os
 import logging
 import hashlib
-import time as time_module
 from datetime import datetime, timezone
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError

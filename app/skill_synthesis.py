@@ -2,24 +2,15 @@ import os
 import json
 import logging
 from datetime import datetime, timezone
-from anthropic import Anthropic
 from app.config import (
-    ANTHROPIC_API_KEY, CLAUDE_MODEL, CLAUDE_MAX_TOKENS_SYNTHESIS,
+    LLM_MAX_TOKENS_SYNTHESIS,
     SYNTHESIS_CHUNKS_PER_BATCH, LAST_SYNTHESIS_FILE,
 )
+from app.llm import chat_completion
 from app.vectorstore import _get_collection, COLLECTION_NAME
 from app.skill_store import create_skill, list_skills
 
 logger = logging.getLogger(__name__)
-
-_client: Anthropic | None = None
-
-
-def _get_client() -> Anthropic:
-    global _client
-    if _client is None:
-        _client = Anthropic(api_key=ANTHROPIC_API_KEY)
-    return _client
 
 
 def _read_last_synthesis_at() -> str | None:
@@ -72,9 +63,8 @@ def _batch_chunks(chunks: list[dict]) -> list[list[dict]]:
     return batches
 
 
-def _synthesize_batch(batch: list[dict]) -> list[dict]:
-    client = _get_client()
-    existing_titles = {s["title"].lower() for s in list_skills()}
+def _synthesize_batch(batch: list[dict], user_id: str = "") -> list[dict]:
+    existing_titles = {s["title"].lower() for s in list_skills(user_id=user_id)}
 
     excerpts = []
     for i, c in enumerate(batch):
@@ -98,19 +88,20 @@ def _synthesize_batch(batch: list[dict]) -> list[dict]:
 
     user_prompt = f"Here are the excerpts to analyze:\n\n{context}"
 
-    response = client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=CLAUDE_MAX_TOKENS_SYNTHESIS,
-        system=system_prompt,
+    response = chat_completion(
         messages=[{"role": "user", "content": user_prompt}],
+        system=system_prompt,
+        max_tokens=LLM_MAX_TOKENS_SYNTHESIS,
     )
 
-    answer = response.content[0].text if response.content else "[]"
+    answer = ""
+    if response.choices and response.choices[0].message.content:
+        answer = response.choices[0].message.content
 
     try:
         procedures = json.loads(answer)
     except json.JSONDecodeError:
-        logger.warning("Failed to parse Claude response as JSON, attempting recovery: %s", answer[:200])
+        logger.warning("Failed to parse LLM response as JSON, attempting recovery: %s", answer[:200])
         import re
         match = re.search(r'\[.*\]', answer, re.DOTALL)
         if match:
@@ -146,13 +137,13 @@ def synthesize(user_id: str | None = None) -> dict:
     batches = _batch_chunks(chunks)
     logger.info("Split into %d batch(es) of %d chunks each", len(batches), SYNTHESIS_CHUNKS_PER_BATCH)
 
-    existing_titles = {s["title"].lower() for s in list_skills()}
+    existing_titles = {s["title"].lower() for s in list_skills(user_id=user_id or "")}
     total_new = 0
     total_skipped = 0
 
     for batch_idx, batch in enumerate(batches):
         logger.info("Processing batch %d/%d...", batch_idx + 1, len(batches))
-        procedures = _synthesize_batch(batch)
+        procedures = _synthesize_batch(batch, user_id=user_id or "")
 
         for proc in procedures:
             title = proc.get("title", "")
@@ -168,6 +159,7 @@ def synthesize(user_id: str | None = None) -> dict:
                     summary=proc.get("summary", ""),
                     steps=proc.get("steps", []),
                     source_chunk_ids=proc.get("source_chunk_ids", []),
+                    user_id=user_id or "",
                 )
                 existing_titles.add(title.lower())
                 total_new += 1

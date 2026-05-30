@@ -26,12 +26,17 @@ def _get_collection(name: str = COLLECTION_NAME) -> chromadb.Collection:
     return _collections[name]
 
 
+def _chunk_id(c: dict) -> str:
+    user_id = c.get("user_id", "")
+    return f"{user_id}_{c['doc_id']}_{c['chunk_index']}"
+
+
 def add_chunks(chunks: list[dict], collection: str = COLLECTION_NAME):
     col = _get_collection(collection)
     if not chunks:
         return
 
-    ids = [f"{c['doc_id']}_{c['chunk_index']}" for c in chunks]
+    ids = [_chunk_id(c) for c in chunks]
     texts = [c["text"] for c in chunks]
     metadatas = [
         {k: v for k, v in c.items() if k != "text"}
@@ -55,16 +60,15 @@ def query(question: str, top_k: int | None = None, collection: str = COLLECTION_
     k = top_k or TOP_K_RETRIEVAL
     [question_embedding] = embed([question])
 
-    where_filter = None
+    kwargs = {
+        "query_embeddings": [question_embedding],
+        "n_results": k,
+        "include": ["documents", "metadatas", "distances"],
+    }
     if user_id:
-        where_filter = {"user_id": user_id}
+        kwargs["where"] = {"user_id": user_id}
 
-    results = col.query(
-        query_embeddings=[question_embedding],
-        n_results=k,
-        where=where_filter,
-        include=["documents", "metadatas", "distances"],
-    )
+    results = col.query(**kwargs)
 
     chunks = []
     if results["ids"] and results["ids"][0]:

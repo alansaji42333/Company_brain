@@ -11,67 +11,76 @@ logger = logging.getLogger(__name__)
 
 TOOL_SCHEMAS = [
     {
-        "name": "send_slack_message",
-        "description": "Send a message to a Slack channel. Only works for channels the bot has been invited to.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "channel_id": {
-                    "type": "string",
-                    "description": "The Slack channel ID to post in (must be one of the configured channels)",
+        "type": "function",
+        "function": {
+            "name": "send_slack_message",
+            "description": "Send a message to a Slack channel. Only works for channels the bot has been invited to.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "channel_id": {
+                        "type": "string",
+                        "description": "The Slack channel ID to post in (must be one of the configured channels)",
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "The message text to send",
+                    },
                 },
-                "message": {
-                    "type": "string",
-                    "description": "The message text to send",
-                },
+                "required": ["channel_id", "message"],
             },
-            "required": ["channel_id", "message"],
         },
     },
     {
-        "name": "create_calendar_event",
-        "description": "Create an event on the user's primary Google Calendar.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "title": {
-                    "type": "string",
-                    "description": "The event title/summary",
+        "type": "function",
+        "function": {
+            "name": "create_calendar_event",
+            "description": "Create an event on the user's primary Google Calendar.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "The event title/summary",
+                    },
+                    "start_time": {
+                        "type": "string",
+                        "description": "ISO 8601 start time (e.g. 2026-06-20T14:00:00)",
+                    },
+                    "end_time": {
+                        "type": "string",
+                        "description": "ISO 8601 end time (e.g. 2026-06-20T15:00:00)",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Optional event description",
+                    },
+                    "attendee_emails": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional list of attendee email addresses",
+                    },
                 },
-                "start_time": {
-                    "type": "string",
-                    "description": "ISO 8601 start time (e.g. 2026-06-20T14:00:00)",
-                },
-                "end_time": {
-                    "type": "string",
-                    "description": "ISO 8601 end time (e.g. 2026-06-20T15:00:00)",
-                },
-                "description": {
-                    "type": "string",
-                    "description": "Optional event description",
-                },
-                "attendee_emails": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Optional list of attendee email addresses",
-                },
+                "required": ["title", "start_time", "end_time"],
             },
-            "required": ["title", "start_time", "end_time"],
         },
     },
     {
-        "name": "append_sheet_row",
-        "description": "Append a row of data to a configured Google Sheet.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "values": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "The cell values for the new row, one per column",
+        "type": "function",
+        "function": {
+            "name": "append_sheet_row",
+            "description": "Append a row of data to a configured Google Sheet.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "values": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "The cell values for the new row, one per column",
+                    },
                 },
+                "required": ["values"],
             },
-            "required": ["values"],
         },
     },
 ]
@@ -80,10 +89,8 @@ TOOL_SCHEMAS = [
 def describe_tool_call(tool_name: str, tool_input: dict) -> str:
     if tool_name == "send_slack_message":
         channel_id = tool_input.get("channel_id", "?")
-        allowed = set(c.strip() for c in SLACK_CHANNEL_IDS.split(",") if c.strip())
-        channel_label = f"channel {channel_id}"
         msg = tool_input.get("message", "")
-        return f"Send to {channel_label}: \"{msg}\""
+        return f'Send to channel {channel_id}: "{msg}"'
 
     if tool_name == "create_calendar_event":
         title = tool_input.get("title", "Untitled")

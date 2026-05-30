@@ -49,6 +49,16 @@
   let conversationId = null;
   let awaitingConfirm = false;
 
+  function getAuthToken() {
+    return localStorage.getItem('auth_token') || prompt('Enter your user token:');
+  }
+
+  function authHeaders(extra) {
+    const h = { ...extra };
+    h['Authorization'] = 'Bearer ' + getAuthToken();
+    return h;
+  }
+
   function addMessage(role, text, sources, confirmData) {
     const div = document.createElement('div');
     div.className = 'msg ' + role;
@@ -106,7 +116,7 @@
     if (conversationId) body.conversation_id = conversationId;
     const res = await fetch('/chat', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(body),
     });
     if (!res.ok) throw new Error('Request failed');
@@ -121,7 +131,7 @@
     try {
       const res = await fetch('/chat/confirm', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ conversation_id: conversationId, approved }),
       });
       if (!res.ok) throw new Error('Request failed');

@@ -8,7 +8,14 @@ from app.config import DATABASE_URL
 
 logger = logging.getLogger(__name__)
 
-engine = create_async_engine(DATABASE_URL, echo=False)
+engine = create_async_engine(
+    DATABASE_URL,
+    echo=False,
+    pool_size=10,
+    max_overflow=20,
+    pool_pre_ping=True,
+    pool_recycle=3600,
+)
 async_session = async_sessionmaker(engine, expire_on_commit=False)
 
 
@@ -20,6 +27,7 @@ class Conversation(Base):
     __tablename__ = "conversations"
 
     id = Column(String, primary_key=True)
+    user_id = Column(String, nullable=False, index=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc),
                         onupdate=lambda: datetime.now(timezone.utc), nullable=False)

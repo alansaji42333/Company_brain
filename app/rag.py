@@ -1,22 +1,13 @@
 import logging
-from anthropic import Anthropic
-from app.config import ANTHROPIC_API_KEY, CLAUDE_MODEL, CLAUDE_MAX_TOKENS, TOP_K_RETRIEVAL
+from app.config import TOP_K_RETRIEVAL, LLM_MAX_TOKENS
+from app.llm import chat_completion
 from app.vectorstore import query_both
 
 logger = logging.getLogger(__name__)
 
-_client: Anthropic | None = None
 
-
-def _get_client() -> Anthropic:
-    global _client
-    if _client is None:
-        _client = Anthropic(api_key=ANTHROPIC_API_KEY)
-    return _client
-
-
-def answer_question(question: str, user_id: str | None = None) -> dict:
-    results = query_both(question, top_k=TOP_K_RETRIEVAL, user_id=user_id)
+def answer_question(question: str, user_id: str = "") -> dict:
+    results = query_both(question, top_k=TOP_K_RETRIEVAL, user_id=user_id or None)
     raw_chunks = results["raw"]
     skill_chunks = results["skills"]
 
@@ -69,15 +60,15 @@ def answer_question(question: str, user_id: str | None = None) -> dict:
 
     user_prompt = f"Context:\n{context}\n\nQuestion: {question}"
 
-    client = _get_client()
-    response = client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=CLAUDE_MAX_TOKENS,
-        system=system_prompt,
+    response = chat_completion(
         messages=[{"role": "user", "content": user_prompt}],
+        system=system_prompt,
+        max_tokens=1024,
     )
 
-    answer = response.content[0].text if response.content else ""
+    answer = ""
+    if response.choices and response.choices[0].message.content:
+        answer = response.choices[0].message.content
 
     return {
         "answer": answer,
