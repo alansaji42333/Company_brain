@@ -5,6 +5,7 @@ services:
     dockerfilePath: ./Dockerfile
     healthCheckPath: /health
     autoDeploy: true
+    dockerContext: .
     envVars:
       - key: PORT
         value: 8000
