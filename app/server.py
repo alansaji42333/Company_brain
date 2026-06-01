@@ -127,8 +127,8 @@ def _read_static(filename: str) -> str:
 @app.on_event("startup")
 async def on_startup():
     validate_config()
-    from app.embeddings import _get_model
-    _get_model()
+    from app.embeddings import _get_ef
+    _get_ef()
     slog.info("startup_complete")
 
 
