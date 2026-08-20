@@ -346,5 +346,10 @@ async def _ws_run_stream(ws: WebSocket, user_id: str, kind: str, **kwargs):
             await ws.send_json({"type": "error", "detail": str(e)})
 
 
-# Serve static assets (if any) -------------------------------------------
+# Serve static assets. The Vite build emits index.html referencing
+# /assets/... (absolute), so mount the assets dir at /assets in addition to
+# the general /static mount. Both point at the same on-disk directory.
+_ASSETS_DIR = os.path.join(_STATIC_DIR, "assets")
+if os.path.isdir(_ASSETS_DIR):
+    app.mount("/assets", StaticFiles(directory=_ASSETS_DIR), name="assets")
 app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
