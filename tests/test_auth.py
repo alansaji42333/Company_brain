@@ -19,7 +19,7 @@ def test_skills_without_auth_returns_401(client):
 
 
 def test_ingest_without_auth_returns_401(client):
-    response = client.post("/ingest")
+    response = client.post("/api/ingest/drive")
     assert response.status_code == 401
 
 

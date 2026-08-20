@@ -6,3 +6,8 @@ credentials.json
 __pycache__/
 *.pyc
 .DS_Store
+
+# Frontend build artifacts (rebuilt from frontend/)
+static/assets/
+node_modules/
+frontend/tsconfig.tsbuildinfo

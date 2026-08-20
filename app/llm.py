@@ -41,3 +41,37 @@ def chat_completion(
 
     response = client.chat.completions.create(**kwargs)
     return response
+
+
+def chat_completion_stream(
+    messages: list[dict],
+    system: str = "",
+    tools: list[dict] | None = None,
+    max_tokens: int = 2048,
+):
+    """Yield raw stream chunks from the OpenAI-compatible streaming API.
+
+    The caller inspects `chunk.choices[0].delta` for `content` (text deltas)
+    and `tool_calls` (function-call deltas) to drive the agent event loop.
+    Returns a generator of ChatCompletionChunk objects.
+    """
+    client = get_client()
+
+    full_messages = []
+    if system:
+        full_messages.append({"role": "system", "content": system})
+    full_messages.extend(messages)
+
+    kwargs = {
+        "model": LLM_MODEL,
+        "messages": full_messages,
+        "max_tokens": max_tokens,
+        "stream": True,
+    }
+    if tools:
+        kwargs["tools"] = tools
+
+    stream = client.chat.completions.create(**kwargs)
+    for chunk in stream:
+        if chunk.choices:
+            yield chunk

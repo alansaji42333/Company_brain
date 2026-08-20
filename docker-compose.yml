@@ -6,15 +6,59 @@ services:
       - "8000:8000"
     env_file:
       - .env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
     volumes:
       - ./data/chroma:/app/data/chroma
       - ./data/skills:/app/data/skills
       - ./data/.last_synthesis_at:/app/data/.last_synthesis_at
       - ./credentials.json:/app/credentials.json:ro
       - ./token.json:/app/token.json:ro
+    depends_on:
+      redis:
+        condition: service_healthy
     deploy:
       resources:
         limits:
           memory: 2G
           cpus: "2.0"
     restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+    entrypoint: scripts/worker-entrypoint.sh
+    env_file:
+      - .env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ./data/chroma:/app/data/chroma
+      - ./data/skills:/app/data/skills
+      - ./data/.last_synthesis_at:/app/data/.last_synthesis_at
+      - ./credentials.json:/app/credentials.json:ro
+      - ./token.json:/app/token.json:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2.0"
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  redis-data:

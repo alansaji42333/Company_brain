@@ -53,7 +53,6 @@ def get_credentials() -> Credentials:
                 raise FileNotFoundError(
                     "Google credentials not found. Set credentials.json file or GOOGLE_CREDENTIALS_JSON env var."
                 )
-            from io import BytesIO
             flow = InstalledAppFlow.from_client_secrets_file(
                 os.path.abspath(CREDENTIALS_FILE) if os.path.exists(CREDENTIALS_FILE) else None,
                 SCOPES,

@@ -47,6 +47,24 @@ class Message(Base):
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
 
 
+class AuditLog(Base):
+    """Immutable record of a sensitive action for enterprise compliance.
+
+    One row per: tool_proposed, tool_confirmed, tool_declined,
+    skill_approved, skill_rejected. Never updated or deleted by app code.
+    """
+    __tablename__ = "audit_logs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(String, nullable=False, index=True)
+    conversation_id = Column(String, nullable=True, index=True)
+    action_type = Column(String(32), nullable=False, index=True)
+    tool_name = Column(String(64), nullable=True)
+    payload = Column(JSON, nullable=True)
+    status = Column(String(16), nullable=False, default="success")
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+
+
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     async with async_session() as session:
         try:

@@ -134,9 +134,10 @@ def _execute_slack_message(tool_input: dict) -> dict:
 
     allowed = set(c.strip() for c in SLACK_CHANNEL_IDS.split(",") if c.strip())
     if channel_id not in allowed:
+        allowed_str = ", ".join(allowed) if allowed else "none"
         return {
             "success": False,
-            "error": f"Channel {channel_id} is not in the configured SLACK_CHANNEL_IDS. Allowed channels: {', '.join(allowed) if allowed else 'none'}",
+            "error": f"Channel {channel_id} is not in the configured SLACK_CHANNEL_IDS. Allowed channels: {allowed_str}",
         }
 
     if not SLACK_BOT_TOKEN:

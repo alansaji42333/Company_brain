@@ -64,8 +64,6 @@ def _batch_chunks(chunks: list[dict]) -> list[list[dict]]:
 
 
 def _synthesize_batch(batch: list[dict], user_id: str = "") -> list[dict]:
-    existing_titles = {s["title"].lower() for s in list_skills(user_id=user_id)}
-
     excerpts = []
     for i, c in enumerate(batch):
         meta = c["metadata"]

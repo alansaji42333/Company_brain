@@ -22,6 +22,25 @@ def _get_client() -> WebClient:
     return _client
 
 
+def _ensure_in_channel(channel_id: str):
+    """Join a channel before ingesting it.
+
+    Slack bots must be members of a channel to read its history. The
+    `channels:join` scope allows joining public channels; private channels
+    still require a manual invite. Failures are logged but non-fatal so
+    ingestion proceeds for channels the bot is already in.
+    """
+    try:
+        client = _get_client()
+        client.conversations_join(channel=channel_id)
+        logger.info("Joined channel %s", channel_id)
+    except SlackApiError as e:
+        err = e.response.get("error", "")
+        if err == "method_not_allowed_for_channel_type" or err == "already_in_channel":
+            return
+        logger.warning("Could not join channel %s: %s", channel_id, err)
+
+
 def _resolve_user(user_id: str) -> str:
     if user_id not in _username_cache:
         try:
@@ -217,6 +236,7 @@ def conversation_to_chunks(
 
 
 def ingest_slack_channel(channel_id: str, user_id: str = "") -> list[dict]:
+    _ensure_in_channel(channel_id)
     channel_name = _get_channel_name(channel_id)
     logger.info("Fetching messages for #%s (%s)", channel_name, channel_id)
 

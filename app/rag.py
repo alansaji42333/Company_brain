@@ -1,5 +1,5 @@
 import logging
-from app.config import TOP_K_RETRIEVAL, LLM_MAX_TOKENS
+from app.config import TOP_K_RETRIEVAL
 from app.llm import chat_completion
 from app.vectorstore import query_both
 
