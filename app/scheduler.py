@@ -5,8 +5,10 @@ Each scheduled run enqueues a background job on the ARQ pool (shared with the
 HTTP-driven async ingest endpoints) so there is a single execution path for
 ingestion and synthesis, whether triggered by a cron tick or an API call.
 
-Scheduled jobs use SCHEDULE_USER_ID as the tenant so scheduled data is
-isolated from interactive users.
+Every scheduled tick iterates over **all organizations** in the database and
+enqueues one job per org, so each tenant's data is ingested and synthesized
+independently. SCHEDULE_USER_ID is only the acting user recorded for
+provenance on those jobs.
 """
 import logging
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -15,6 +17,8 @@ from app.config import (
     SCHEDULE_ENABLED, SCHEDULE_INGEST_CRON, SCHEDULE_SYNTHESIS_CRON,
     SCHEDULE_USER_ID,
 )
+from app.database import SessionLocal
+from app.orgs import list_all_org_ids
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +43,27 @@ async def _enqueue_safe(function: str, user_id: str, **kwargs):
         logger.exception("Scheduler failed to enqueue %s", function)
 
 
+async def _enqueue_for_all_orgs(function: str, **kwargs):
+    """Enqueue `function` once per organization in the database."""
+    if _pool is None:
+        logger.warning("Scheduler cannot enqueue %s: ARQ pool not available", function)
+        return
+    try:
+        async with SessionLocal() as db:
+            org_ids = await list_all_org_ids(db)
+    except Exception:
+        logger.exception("Scheduler could not list organizations for %s", function)
+        return
+
+    if not org_ids:
+        logger.info("Scheduler skipped %s: no organizations configured", function)
+        return
+
+    for org_id in org_ids:
+        await _enqueue_safe(function, SCHEDULE_USER_ID, org_id=org_id, **kwargs)
+    logger.info("Scheduler enqueued %s for %d org(s)", function, len(org_ids))
+
+
 def start_scheduler(app=None):
     global _scheduler
     if not SCHEDULE_ENABLED:
@@ -51,19 +76,19 @@ def start_scheduler(app=None):
 
     _scheduler = AsyncIOScheduler()
     _scheduler.add_job(
-        lambda: _enqueue_safe("ingest_drive", SCHEDULE_USER_ID, folder_id=None, user_id=SCHEDULE_USER_ID),
+        lambda: _enqueue_for_all_orgs("ingest_drive", folder_id=None),
         CronTrigger.from_crontab(SCHEDULE_INGEST_CRON),
         id="drive_ingest",
         replace_existing=True,
     )
     _scheduler.add_job(
-        lambda: _enqueue_safe("ingest_slack", SCHEDULE_USER_ID, user_id=SCHEDULE_USER_ID),
+        lambda: _enqueue_for_all_orgs("ingest_slack"),
         CronTrigger.from_crontab(SCHEDULE_INGEST_CRON),
         id="slack_ingest",
         replace_existing=True,
     )
     _scheduler.add_job(
-        lambda: _enqueue_safe("synthesize", SCHEDULE_USER_ID, user_id=SCHEDULE_USER_ID),
+        lambda: _enqueue_for_all_orgs("synthesize"),
         CronTrigger.from_crontab(SCHEDULE_SYNTHESIS_CRON),
         id="synthesis",
         replace_existing=True,

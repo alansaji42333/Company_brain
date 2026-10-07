@@ -24,38 +24,40 @@ def redis_settings() -> RedisSettings:
 # --- registered job functions ------------------------------------------
 # Each must accept the ARQ context (`ctx`) as the first argument.
 
-async def ingest_drive(ctx: dict, folder_id: str | None = None, user_id: str = "") -> dict:
+async def ingest_drive(
+    ctx: dict, folder_id: str | None = None, user_id: str = "", org_id: str = "",
+) -> dict:
     """Ingest a Google Drive folder: extract → chunk → embed → store."""
     from app.drive_ingest import ingest_drive_folder
     from app.chunking import chunk_documents
     from app.vectorstore import add_chunks
 
-    logger.info("job ingest_drive: folder_id=%s user_id=%s", folder_id, user_id)
-    documents = ingest_drive_folder(folder_id, user_id=user_id)
-    chunks = chunk_documents(documents, user_id=user_id)
+    logger.info("job ingest_drive: folder_id=%s org_id=%s user_id=%s", folder_id, org_id, user_id)
+    documents = ingest_drive_folder(folder_id, user_id=user_id, org_id=org_id)
+    chunks = chunk_documents(documents, user_id=user_id, org_id=org_id)
     add_chunks(chunks)
     logger.info("job ingest_drive done: %d files, %d chunks", len(documents), len(chunks))
     return {"files_processed": len(documents), "chunks_stored": len(chunks)}
 
 
-async def ingest_slack(ctx: dict, user_id: str = "") -> dict:
+async def ingest_slack(ctx: dict, user_id: str = "", org_id: str = "") -> dict:
     """Ingest Slack channels: history → threads → chunk → embed → store."""
     from app.slack_ingest import ingest_slack as run_ingest
     from app.vectorstore import add_chunks
 
-    logger.info("job ingest_slack: user_id=%s", user_id)
-    chunks = run_ingest(user_id=user_id)
+    logger.info("job ingest_slack: org_id=%s user_id=%s", org_id, user_id)
+    chunks = run_ingest(user_id=user_id, org_id=org_id)
     add_chunks(chunks)
     logger.info("job ingest_slack done: %d chunks", len(chunks))
     return {"chunks_stored": len(chunks)}
 
 
-async def synthesize(ctx: dict, user_id: str = "") -> dict:
-    """Run skill synthesis over newly ingested chunks."""
+async def synthesize(ctx: dict, user_id: str = "", org_id: str = "") -> dict:
+    """Run skill synthesis over newly ingested chunks for one org."""
     from app.skill_synthesis import synthesize as run_synthesis
 
-    logger.info("job synthesize: user_id=%s", user_id)
-    summary = run_synthesis(user_id=user_id)
+    logger.info("job synthesize: org_id=%s user_id=%s", org_id, user_id)
+    summary = run_synthesis(org_id=org_id)
     logger.info("job synthesize done: %s", summary)
     return summary
 
