@@ -6,16 +6,23 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 
+def _org_id(args) -> str:
+    """Resolve --org-id, defaulting to the caller's personal org."""
+    from app.orgs import personal_org_id
+    return args.org_id or personal_org_id(args.user_id or "cli")
+
+
 def cmd_ingest(args):
     from app.drive_ingest import ingest_drive_folder
     from app.chunking import chunk_documents
     from app.vectorstore import add_chunks
 
     user_id = args.user_id or "cli"
-    documents = ingest_drive_folder(args.folder_id, user_id=user_id)
-    chunks = chunk_documents(documents, user_id=user_id)
+    org_id = _org_id(args)
+    documents = ingest_drive_folder(args.folder_id, user_id=user_id, org_id=org_id)
+    chunks = chunk_documents(documents, user_id=user_id, org_id=org_id)
     add_chunks(chunks)
-    logger.info("Ingestion complete — %d chunk(s) stored", len(chunks))
+    logger.info("Ingestion complete — %d chunk(s) stored for org %s", len(chunks), org_id)
 
 
 def cmd_ingest_slack(args):
@@ -23,19 +30,20 @@ def cmd_ingest_slack(args):
     from app.vectorstore import add_chunks
 
     user_id = args.user_id or "cli"
-    chunks = ingest_slack(user_id=user_id)
+    org_id = _org_id(args)
+    chunks = ingest_slack(user_id=user_id, org_id=org_id)
     add_chunks(chunks)
-    logger.info("Slack ingestion complete — %d chunk(s) stored", len(chunks))
+    logger.info("Slack ingestion complete — %d chunk(s) stored for org %s", len(chunks), org_id)
 
 
 def cmd_synthesize(args):
     from app.skill_synthesis import synthesize
 
-    user_id = args.user_id or "cli"
-    summary = synthesize(user_id=user_id)
+    org_id = _org_id(args)
+    summary = synthesize(org_id=org_id)
     logger.info(
-        "Synthesis complete — %d batch(es), %d new skill(s), %d skipped",
-        summary["batches_processed"], summary["new_skills"], summary["skipped_duplicates"],
+        "Synthesis complete — %d batch(es), %d new skill(s), %d skipped (org %s)",
+        summary["batches_processed"], summary["new_skills"], summary["skipped_duplicates"], org_id,
     )
 
 
@@ -48,7 +56,8 @@ def cmd_ask(args):
         sys.exit(1)
 
     user_id = args.user_id or "cli"
-    result = answer_question(question, user_id=user_id)
+    org_id = _org_id(args)
+    result = answer_question(question, org_id=org_id, user_id=user_id)
     print(f"\nAnswer:\n{result['answer']}\n")
     if result["sources"]:
         print("Sources:")
@@ -63,22 +72,26 @@ def main():
     parser = argparse.ArgumentParser(description="Company Brain — RAG over your company documents")
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
+    def add_tenant_args(p):
+        p.add_argument("--user-id", default="cli", help="User ID (acting user / provenance)")
+        p.add_argument("--org-id", default=None, help="Organization ID (defaults to the personal org)")
+
     ingest_parser = subparsers.add_parser("ingest", help="Ingest documents from Google Drive")
     ingest_parser.add_argument("--folder-id", help="Override the folder ID from .env")
-    ingest_parser.add_argument("--user-id", default="cli", help="User ID for multi-tenant isolation")
+    add_tenant_args(ingest_parser)
     ingest_parser.set_defaults(func=cmd_ingest)
 
     ingest_slack_parser = subparsers.add_parser("ingest-slack", help="Ingest messages from Slack")
-    ingest_slack_parser.add_argument("--user-id", default="cli", help="User ID for multi-tenant isolation")
+    add_tenant_args(ingest_slack_parser)
     ingest_slack_parser.set_defaults(func=cmd_ingest_slack)
 
     synthesize_parser = subparsers.add_parser("synthesize", help="Run skill synthesis on ingested content")
-    synthesize_parser.add_argument("--user-id", default="cli", help="User ID for multi-tenant isolation")
+    add_tenant_args(synthesize_parser)
     synthesize_parser.set_defaults(func=cmd_synthesize)
 
     ask_parser = subparsers.add_parser("ask", help="Ask a question about your documents")
     ask_parser.add_argument("question", nargs="?", help="Your question")
-    ask_parser.add_argument("--user-id", default="cli", help="User ID for multi-tenant isolation")
+    add_tenant_args(ask_parser)
     ask_parser.set_defaults(func=cmd_ask)
 
     args = parser.parse_args()

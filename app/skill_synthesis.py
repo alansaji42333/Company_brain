@@ -13,28 +13,33 @@ from app.skill_store import create_skill, list_skills
 logger = logging.getLogger(__name__)
 
 
-def _read_last_synthesis_at() -> str | None:
-    if os.path.exists(LAST_SYNTHESIS_FILE):
-        with open(LAST_SYNTHESIS_FILE) as f:
+def _last_synthesis_file(org_id: str) -> str:
+    return f"{LAST_SYNTHESIS_FILE}.{org_id}" if org_id else LAST_SYNTHESIS_FILE
+
+
+def _read_last_synthesis_at(org_id: str) -> str | None:
+    path = _last_synthesis_file(org_id)
+    if os.path.exists(path):
+        with open(path) as f:
             val = f.read().strip()
             return val if val else None
     return None
 
 
-def _write_last_synthesis_at(timestamp: str):
-    with open(LAST_SYNTHESIS_FILE, "w") as f:
+def _write_last_synthesis_at(org_id: str, timestamp: str):
+    with open(_last_synthesis_file(org_id), "w") as f:
         f.write(timestamp)
 
 
-def _fetch_new_chunks(last_synthesis_at: str | None, user_id: str | None = None) -> list[dict]:
+def _fetch_new_chunks(last_synthesis_at: str | None, org_id: str | None = None) -> list[dict]:
     col = _get_collection(COLLECTION_NAME)
     where = None
-    if last_synthesis_at and user_id:
-        where = {"$and": [{"ingested_at": {"$gt": last_synthesis_at}}, {"user_id": user_id}]}
+    if last_synthesis_at and org_id:
+        where = {"$and": [{"ingested_at": {"$gt": last_synthesis_at}}, {"org_id": org_id}]}
     elif last_synthesis_at:
         where = {"ingested_at": {"$gt": last_synthesis_at}}
-    elif user_id:
-        where = {"user_id": user_id}
+    elif org_id:
+        where = {"org_id": org_id}
 
     offset = 0
     limit = 1000
@@ -63,7 +68,7 @@ def _batch_chunks(chunks: list[dict]) -> list[list[dict]]:
     return batches
 
 
-def _synthesize_batch(batch: list[dict], user_id: str = "") -> list[dict]:
+def _synthesize_batch(batch: list[dict]) -> list[dict]:
     excerpts = []
     for i, c in enumerate(batch):
         meta = c["metadata"]
@@ -123,9 +128,15 @@ def _synthesize_batch(batch: list[dict], user_id: str = "") -> list[dict]:
     return procedures
 
 
-def synthesize(user_id: str | None = None) -> dict:
-    last_at = _read_last_synthesis_at()
-    chunks = _fetch_new_chunks(last_at, user_id=user_id)
+def synthesize(org_id: str | None = None) -> dict:
+    """Run synthesis over an org's newly ingested chunks.
+
+    `org_id` is required in production; skills are created per-org. The
+    watermark is tracked per-org so organizations progress independently.
+    """
+    org_id = org_id or ""
+    last_at = _read_last_synthesis_at(org_id)
+    chunks = _fetch_new_chunks(last_at, org_id=org_id)
 
     if not chunks:
         logger.info("No new chunks since last synthesis (or first run with no data)")
@@ -135,13 +146,13 @@ def synthesize(user_id: str | None = None) -> dict:
     batches = _batch_chunks(chunks)
     logger.info("Split into %d batch(es) of %d chunks each", len(batches), SYNTHESIS_CHUNKS_PER_BATCH)
 
-    existing_titles = {s["title"].lower() for s in list_skills(user_id=user_id or "")}
+    existing_titles = {s["title"].lower() for s in list_skills(org_id=org_id)}
     total_new = 0
     total_skipped = 0
 
     for batch_idx, batch in enumerate(batches):
         logger.info("Processing batch %d/%d...", batch_idx + 1, len(batches))
-        procedures = _synthesize_batch(batch, user_id=user_id or "")
+        procedures = _synthesize_batch(batch)
 
         for proc in procedures:
             title = proc.get("title", "")
@@ -153,11 +164,11 @@ def synthesize(user_id: str | None = None) -> dict:
                 continue
             try:
                 create_skill(
+                    org_id=org_id,
                     title=title,
                     summary=proc.get("summary", ""),
                     steps=proc.get("steps", []),
                     source_chunk_ids=proc.get("source_chunk_ids", []),
-                    user_id=user_id or "",
                 )
                 existing_titles.add(title.lower())
                 total_new += 1
@@ -165,7 +176,7 @@ def synthesize(user_id: str | None = None) -> dict:
                 logger.error("Failed to create skill '%s': %s", title, e)
 
     now = datetime.now(timezone.utc).isoformat()
-    _write_last_synthesis_at(now)
+    _write_last_synthesis_at(org_id, now)
 
     return {
         "batches_processed": len(batches),

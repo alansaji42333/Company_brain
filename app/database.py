@@ -1,7 +1,7 @@
 import logging
 from datetime import datetime, timezone
 from typing import AsyncGenerator
-from sqlalchemy import Column, String, DateTime, JSON, ForeignKey, Integer
+from sqlalchemy import Column, String, DateTime, JSON, ForeignKey, Integer, UniqueConstraint
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, relationship
 from app.config import DATABASE_URL
@@ -23,10 +23,36 @@ class Base(DeclarativeBase):
     pass
 
 
+class Organization(Base):
+    """A workspace (tenant). Users belong to organizations via memberships."""
+    __tablename__ = "organizations"
+
+    id = Column(String, primary_key=True)
+    name = Column(String, nullable=False)
+    slug = Column(String, nullable=False, unique=True, index=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+
+    memberships = relationship("Membership", backref="organization", lazy="selectin",
+                               cascade="all, delete-orphan")
+
+
+class Membership(Base):
+    """Role of a user within an organization."""
+    __tablename__ = "memberships"
+    __table_args__ = (UniqueConstraint("org_id", "user_id", name="uq_memberships_org_user"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    org_id = Column(String, ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(String, nullable=False, index=True)
+    role = Column(String(16), nullable=False, server_default="member")
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+
+
 class Conversation(Base):
     __tablename__ = "conversations"
 
     id = Column(String, primary_key=True)
+    org_id = Column(String, ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True)
     user_id = Column(String, nullable=False, index=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc),
@@ -56,6 +82,7 @@ class AuditLog(Base):
     __tablename__ = "audit_logs"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    org_id = Column(String, ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True)
     user_id = Column(String, nullable=False, index=True)
     conversation_id = Column(String, nullable=True, index=True)
     action_type = Column(String(32), nullable=False, index=True)

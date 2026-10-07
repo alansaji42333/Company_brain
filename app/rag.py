@@ -6,8 +6,8 @@ from app.vectorstore import query_both
 logger = logging.getLogger(__name__)
 
 
-def answer_question(question: str, user_id: str = "") -> dict:
-    results = query_both(question, top_k=TOP_K_RETRIEVAL, user_id=user_id or None)
+def answer_question(question: str, org_id: str = "", user_id: str = "") -> dict:
+    results = query_both(question, top_k=TOP_K_RETRIEVAL, org_id=org_id or None, user_id=user_id or None)
     raw_chunks = results["raw"]
     skill_chunks = results["skills"]
 

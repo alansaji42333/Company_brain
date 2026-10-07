@@ -4,10 +4,13 @@ Two modes are supported, controlled by config:
 - Shared-secret HS256 JWTs (dev / fallback) when JWT_SECRET is set and AUTH0_ENABLED is false.
 - Auth0 RS256 JWTs verified against the tenant's JWKS endpoint when AUTH0_ENABLED is true.
 
-Both modes resolve a `user_id` (the JWT `sub` claim) used for multi-tenant isolation.
+Both modes resolve a `user_id` (the JWT `sub` claim). Organization resolution
+happens in app.orgs.resolve_auth_context, which verifies a real membership so
+a JWT `org_id` claim (or X-Org-Id header) is never trusted on its own.
 """
 import logging
 import time
+from dataclasses import dataclass
 import httpx
 from jose import jwt, JWTError
 from app.config import (
@@ -18,6 +21,14 @@ from app.config import (
 logger = logging.getLogger(__name__)
 
 _jwks_cache: dict = {"fetched_at": 0.0, "keys": []}
+
+
+@dataclass(frozen=True)
+class AuthContext:
+    """Resolved identity for a request: user + verified org membership + role."""
+    user_id: str
+    org_id: str
+    role: str
 
 
 class AuthError(Exception):
@@ -46,7 +57,7 @@ def _fetch_jwks() -> list[dict]:
     return keys
 
 
-def _verify_auth0_token(token: str) -> str:
+def _verify_auth0_token(token: str) -> dict:
     try:
         unverified_header = jwt.get_unverified_header(token)
     except JWTError:
@@ -74,10 +85,10 @@ def _verify_auth0_token(token: str) -> str:
     user_id = payload.get("sub")
     if not user_id:
         raise AuthError("Token missing 'sub' claim")
-    return str(user_id)
+    return payload
 
 
-def _verify_shared_secret_token(token: str) -> str:
+def _verify_shared_secret_token(token: str) -> dict:
     if not JWT_SECRET:
         raise AuthError("No JWT_SECRET configured for shared-secret mode", 500)
     try:
@@ -87,7 +98,19 @@ def _verify_shared_secret_token(token: str) -> str:
     user_id = payload.get("sub")
     if not user_id:
         raise AuthError("Token missing 'sub' claim")
-    return str(user_id)
+    return payload
+
+
+def _decode_payload(token: str) -> dict:
+    """Verify a token and return its full claims payload (never trusts them)."""
+    if not token:
+        raise AuthError("Empty token")
+    if AUTH0_ENABLED:
+        return _verify_auth0_token(token)
+    if JWT_SECRET:
+        return _verify_shared_secret_token(token)
+    logger.warning("No auth provider configured — treating raw token as user_id (dev mode)")
+    return {"sub": token}
 
 
 def verify_token(token: str) -> str:
@@ -96,11 +119,13 @@ def verify_token(token: str) -> str:
     Auth0 is used when enabled; otherwise falls back to HS256 shared-secret mode.
     If neither is configured, the raw token is treated as the user_id (dev only).
     """
-    if not token:
-        raise AuthError("Empty token")
-    if AUTH0_ENABLED:
-        return _verify_auth0_token(token)
-    if JWT_SECRET:
-        return _verify_shared_secret_token(token)
-    logger.warning("No auth provider configured — treating raw token as user_id (dev mode)")
-    return token
+    return str(_decode_payload(token).get("sub") or "")
+
+
+def verify_token_payload(token: str) -> dict:
+    """Verify a bearer token and return its decoded claims payload.
+
+    The payload (e.g. an `org_id` claim) must never be trusted alone —
+    callers must still verify an actual membership in the resolved org.
+    """
+    return _decode_payload(token)

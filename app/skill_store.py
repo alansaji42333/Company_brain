@@ -24,48 +24,66 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _user_dir(user_id: str) -> str:
-    safe = re.sub(r"[^a-zA-Z0-9_-]", "", user_id)
+def _org_dir(org_id: str) -> str:
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "", org_id)
     path = os.path.join(SKILLS_DIR, safe)
     os.makedirs(path, exist_ok=True)
     return path
 
 
-def _list_files(user_id: str) -> list[str]:
-    d = _user_dir(user_id)
+def _list_files(org_id: str) -> list[str]:
+    d = _org_dir(org_id)
     return sorted(
         f for f in os.listdir(d)
         if f.endswith(".md") and not f.startswith(".")
     )
 
 
-def list_skills(user_id: str = "") -> list[dict[str, Any]]:
+def _load_status(path: str, filename: str) -> dict[str, Any] | None:
+    try:
+        with open(path) as f:
+            post = frontmatter.load(f)
+    except Exception:
+        return None
+    return {
+        "id": post.get("id", filename.replace(".md", "")),
+        "title": post.get("title", filename.replace(".md", "")),
+        "status": post.get("status", "draft"),
+        "created_at": post.get("created_at", ""),
+        "updated_at": post.get("updated_at", ""),
+        "_post": post,
+    }
+
+
+def list_skills(org_id: str = "", only_approved: bool = False) -> list[dict[str, Any]]:
+    """List skills for an org. Members (non-reviewers) see approved skills only."""
     skills = []
-    for filename in _list_files(user_id):
-        path = os.path.join(_user_dir(user_id), filename)
-        try:
-            with open(path) as f:
-                post = frontmatter.load(f)
-        except Exception:
+    for filename in _list_files(org_id):
+        info = _load_status(os.path.join(_org_dir(org_id), filename), filename)
+        if info is None:
+            continue
+        if only_approved and info["status"] != "approved":
             continue
         skills.append({
-            "id": post.get("id", filename.replace(".md", "")),
-            "title": post.get("title", filename.replace(".md", "")),
-            "status": post.get("status", "draft"),
-            "created_at": post.get("created_at", ""),
-            "updated_at": post.get("updated_at", ""),
+            "id": info["id"],
+            "title": info["title"],
+            "status": info["status"],
+            "created_at": info["created_at"],
+            "updated_at": info["updated_at"],
         })
     return skills
 
 
-def get_skill(skill_id: str, user_id: str = "") -> dict[str, Any] | None:
-    path = os.path.join(_user_dir(user_id), f"{skill_id}.md")
+def get_skill(org_id: str, skill_id: str, only_approved: bool = False) -> dict[str, Any] | None:
+    path = os.path.join(_org_dir(org_id), f"{skill_id}.md")
     if not os.path.exists(path):
         return None
     try:
         with open(path) as f:
             post = frontmatter.load(f)
     except Exception:
+        return None
+    if only_approved and post.get("status") != "approved":
         return None
     return {
         "id": skill_id,
@@ -78,8 +96,8 @@ def get_skill(skill_id: str, user_id: str = "") -> dict[str, Any] | None:
     }
 
 
-def save_skill(skill_id: str, body_content: str, user_id: str = ""):
-    path = os.path.join(_user_dir(user_id), f"{skill_id}.md")
+def save_skill(org_id: str, skill_id: str, body_content: str):
+    path = os.path.join(_org_dir(org_id), f"{skill_id}.md")
     now = _now_iso()
 
     if os.path.exists(path):
@@ -100,9 +118,10 @@ def save_skill(skill_id: str, body_content: str, user_id: str = ""):
         f.write(frontmatter.dumps(post))
 
 
-def create_skill(title: str, summary: str, steps: list[str], source_chunk_ids: list[str], user_id: str = "") -> str:
+def create_skill(org_id: str, title: str, summary: str, steps: list[str], source_chunk_ids: list[str]) -> str:
+    """Create a draft skill doc for an org. Returns the skill_id (existing ones dedupe)."""
     skill_id = _slugify(title)
-    path = os.path.join(_user_dir(user_id), f"{skill_id}.md")
+    path = os.path.join(_org_dir(org_id), f"{skill_id}.md")
     if os.path.exists(path):
         return skill_id
 
@@ -126,8 +145,8 @@ def create_skill(title: str, summary: str, steps: list[str], source_chunk_ids: l
     return skill_id
 
 
-def approve_skill(skill_id: str, user_id: str = ""):
-    path = os.path.join(_user_dir(user_id), f"{skill_id}.md")
+def approve_skill(org_id: str, skill_id: str):
+    path = os.path.join(_org_dir(org_id), f"{skill_id}.md")
     if not os.path.exists(path):
         raise ValueError(f"Skill {skill_id} not found")
 
@@ -141,21 +160,22 @@ def approve_skill(skill_id: str, user_id: str = ""):
 
     full_text = f"# {post['title']}\n\n{post.content}"
     chunk = {
-        "doc_id": f"skill_{skill_id}",
+        "doc_id": f"skill_{org_id}_{skill_id}",
         "doc_name": post["title"],
         "source_url": "",
         "chunk_index": 0,
         "text": full_text,
         "source_type": "playbook",
         "ingested_at": _now_iso(),
-        "user_id": user_id,
+        "user_id": "",
+        "org_id": org_id,
     }
     add_chunks([chunk], collection=COLLECTION_SKILLS)
     logger.info("Approved and embedded skill doc: %s", skill_id)
 
 
-def reject_skill(skill_id: str, user_id: str = ""):
-    path = os.path.join(_user_dir(user_id), f"{skill_id}.md")
+def reject_skill(org_id: str, skill_id: str):
+    path = os.path.join(_org_dir(org_id), f"{skill_id}.md")
     if not os.path.exists(path):
         raise ValueError(f"Skill {skill_id} not found")
 
@@ -167,6 +187,6 @@ def reject_skill(skill_id: str, user_id: str = ""):
     with open(path, "w") as f:
         f.write(frontmatter.dumps(post))
 
-    doc_id = f"{user_id}_skill_{skill_id}_0"
+    doc_id = f"{org_id}_skill_{skill_id}_0"
     delete_by_ids([doc_id], collection=COLLECTION_SKILLS)
     logger.info("Rejected and removed skill doc from retrieval: %s", skill_id)

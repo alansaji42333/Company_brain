@@ -8,7 +8,7 @@ def token_count(text: str) -> int:
     return len(encoder.encode(text))
 
 
-def chunk_document(doc: dict, user_id: str = "") -> list[dict]:
+def chunk_document(doc: dict, user_id: str = "", org_id: str = "") -> list[dict]:
     text = doc["text"]
     tokens = encoder.encode(text)
     chunks = []
@@ -32,6 +32,7 @@ def chunk_document(doc: dict, user_id: str = "") -> list[dict]:
             "chunk_index": chunk_index,
             "text": chunk_text,
             "user_id": user_id,
+            "org_id": org_id,
             **extra_fields,
         })
 
@@ -43,8 +44,8 @@ def chunk_document(doc: dict, user_id: str = "") -> list[dict]:
     return chunks
 
 
-def chunk_documents(documents: list[dict], user_id: str = "") -> list[dict]:
+def chunk_documents(documents: list[dict], user_id: str = "", org_id: str = "") -> list[dict]:
     all_chunks = []
     for doc in documents:
-        all_chunks.extend(chunk_document(doc, user_id=user_id))
+        all_chunks.extend(chunk_document(doc, user_id=user_id, org_id=org_id))
     return all_chunks

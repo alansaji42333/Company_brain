@@ -23,6 +23,7 @@ ACTION_SKILL_REJECTED = "skill_rejected"
 
 async def record(
     db: AsyncSession,
+    org_id: str,
     user_id: str,
     action_type: str,
     conversation_id: str | None = None,
@@ -38,6 +39,7 @@ async def record(
     """
     try:
         db.add(AuditLog(
+            org_id=org_id,
             user_id=user_id,
             conversation_id=conversation_id,
             action_type=action_type,
@@ -47,16 +49,16 @@ async def record(
         ))
         await db.flush()
     except Exception as e:
-        logger.error("Failed to record audit %s for user %s: %s", action_type, user_id, e)
+        logger.error("Failed to record audit %s for org %s user %s: %s", action_type, org_id, user_id, e)
         raise
 
 
-async def list_for_user(db: AsyncSession, user_id: str, limit: int = 100) -> list[dict]:
-    """Return the most recent audit rows for a user (for admin inspection)."""
+async def list_for_org(db: AsyncSession, org_id: str, limit: int = 100) -> list[dict]:
+    """Return the most recent audit rows for an organization (admin inspection)."""
     from sqlalchemy import select
     result = await db.execute(
         select(AuditLog)
-        .where(AuditLog.user_id == user_id)
+        .where(AuditLog.org_id == org_id)
         .order_by(AuditLog.created_at.desc())
         .limit(limit)
     )
@@ -64,6 +66,7 @@ async def list_for_user(db: AsyncSession, user_id: str, limit: int = 100) -> lis
     return [
         {
             "id": r.id,
+            "org_id": r.org_id,
             "user_id": r.user_id,
             "conversation_id": r.conversation_id,
             "action_type": r.action_type,

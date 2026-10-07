@@ -5,7 +5,25 @@ from slowapi.util import get_remote_address
 
 load_dotenv()
 
-limiter = Limiter(key_func=get_remote_address)
+
+def _rate_limit_key(request) -> str:
+    """Rate limit by the authenticated user_id when available (unverified claim
+    read only — rate limiting is not an auth boundary), else client address."""
+    authorization = request.headers.get("Authorization", "")
+    if authorization.startswith("Bearer "):
+        token = authorization[len("Bearer "):].strip()
+        try:
+            from jose import jwt
+            payload = jwt.get_unverified_claims(token)
+            sub = payload.get("sub")
+            if sub:
+                return f"user:{sub}"
+        except Exception:
+            pass
+    return get_remote_address(request)
+
+
+limiter = Limiter(key_func=_rate_limit_key)
 
 GOOGLE_DRIVE_FOLDER_ID: str = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "")
 SLACK_BOT_TOKEN: str = os.getenv("SLACK_BOT_TOKEN", "")
@@ -69,6 +87,8 @@ REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 SCHEDULE_ENABLED: bool = os.getenv("SCHEDULE_ENABLED", "false").lower() in ("1", "true", "yes")
 SCHEDULE_INGEST_CRON: str = os.getenv("SCHEDULE_INGEST_CRON", "0 */6 * * *")
 SCHEDULE_SYNTHESIS_CRON: str = os.getenv("SCHEDULE_SYNTHESIS_CRON", "30 */6 * * *")
+# Acting user for scheduled jobs (used for provenance only). Jobs run per-org
+# for every organization in the database.
 SCHEDULE_USER_ID: str = os.getenv("SCHEDULE_USER_ID", "scheduled")
 
 # Workers / server --------------------------------------------------------

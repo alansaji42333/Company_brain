@@ -35,8 +35,8 @@ def _call_llm_stream(messages: list[dict], system: str, tools: list[dict] | None
     return chat_completion_stream(messages=messages, system=system, tools=tools, max_tokens=max_tokens)
 
 
-def _build_context(question: str, user_id: str | None = None) -> tuple[str, list[dict]]:
-    results = query_both(question, top_k=TOP_K_RETRIEVAL, user_id=user_id)
+def _build_context(question: str, org_id: str | None = None) -> tuple[str, list[dict]]:
+    results = query_both(question, top_k=TOP_K_RETRIEVAL, org_id=org_id)
     raw_chunks = results["raw"]
     skill_chunks = results["skills"]
 
@@ -185,11 +185,15 @@ async def _add_tool_result(db: AsyncSession, conversation_id: str, tool_use_id: 
     ))
 
 
-async def send_message(conversation_id: str | None, message: str, db: AsyncSession, user_id: str = "") -> dict:
+async def send_message(conversation_id: str | None, message: str, db: AsyncSession, user_id: str = "", org_id: str = "") -> dict:
     try:
         if conversation_id:
             result = await db.execute(
-                select(Conversation).where(Conversation.id == conversation_id, Conversation.user_id == user_id)
+                select(Conversation).where(
+                    Conversation.id == conversation_id,
+                    Conversation.user_id == user_id,
+                    Conversation.org_id == org_id,
+                )
             )
             conv = result.scalar_one_or_none()
         else:
@@ -197,7 +201,7 @@ async def send_message(conversation_id: str | None, message: str, db: AsyncSessi
 
         if conv is None:
             conversation_id = str(uuid.uuid4())
-            conv = Conversation(id=conversation_id, user_id=user_id)
+            conv = Conversation(id=conversation_id, user_id=user_id, org_id=org_id)
             db.add(conv)
             await db.flush()
 
@@ -206,12 +210,12 @@ async def send_message(conversation_id: str | None, message: str, db: AsyncSessi
         await _add_user_message(db, conversation_id, message)
 
         history = await _load_messages(db, conversation_id)
-        context, sources = _build_context(message, user_id=user_id)
+        context, sources = _build_context(message, org_id=org_id)
         system_prompt = _build_system_prompt(context)
 
         response = _call_llm(history, system=system_prompt, tools=TOOL_SCHEMAS, max_tokens=LLM_MAX_TOKENS)
 
-        result = await _process_response(response, conv, db, conversation_id, sources, user_id=user_id)
+        result = await _process_response(response, conv, db, conversation_id, sources, user_id=user_id, org_id=org_id)
         await db.commit()
         return result
     except SQLAlchemyError:
@@ -222,10 +226,14 @@ async def send_message(conversation_id: str | None, message: str, db: AsyncSessi
         raise
 
 
-async def confirm_action(conversation_id: str, approved: bool, db: AsyncSession, user_id: str = "") -> dict:
+async def confirm_action(conversation_id: str, approved: bool, db: AsyncSession, user_id: str = "", org_id: str = "") -> dict:
     try:
         result = await db.execute(
-            select(Conversation).where(Conversation.id == conversation_id, Conversation.user_id == user_id)
+            select(Conversation).where(
+                Conversation.id == conversation_id,
+                Conversation.user_id == user_id,
+                Conversation.org_id == org_id,
+            )
         )
         conv = result.scalar_one_or_none()
         if not conv:
@@ -262,7 +270,7 @@ async def confirm_action(conversation_id: str, approved: bool, db: AsyncSession,
             audit_status = "declined"
 
         await audit.record(
-            db, user_id, audit_action,
+            db, org_id, user_id, audit_action,
             conversation_id=conversation_id, tool_name=tool_name,
             payload={"tool_id": tool_use_id, "arguments": tool_input, "result": tool_result},
             status=audit_status,
@@ -270,7 +278,7 @@ async def confirm_action(conversation_id: str, approved: bool, db: AsyncSession,
 
         await _add_tool_result(db, conversation_id, tool_use_id, tool_result_content, is_error)
 
-        result = await _continue(conv, db, conversation_id, [], iteration=0, user_id=user_id)
+        result = await _continue(conv, db, conversation_id, [], iteration=0, user_id=user_id, org_id=org_id)
         await db.commit()
         return result
     except SQLAlchemyError:
@@ -283,7 +291,7 @@ async def confirm_action(conversation_id: str, approved: bool, db: AsyncSession,
 
 async def _continue(
     conv: Conversation, db: AsyncSession, conversation_id: str,
-    sources: list[dict], iteration: int, user_id: str = "",
+    sources: list[dict], iteration: int, user_id: str = "", org_id: str = "",
 ) -> dict:
     if iteration > AGENT_MAX_ITERATIONS:
         return {
@@ -293,18 +301,18 @@ async def _continue(
             "sources": sources,
         }
 
-    context, sources = _build_context("", user_id=user_id)
+    context, sources = _build_context("", org_id=org_id)
     system_prompt = _build_system_prompt(context)
     history = await _load_messages(db, conversation_id)
 
     response = _call_llm(history, system=system_prompt, tools=TOOL_SCHEMAS, max_tokens=LLM_MAX_TOKENS)
 
-    return await _process_response(response, conv, db, conversation_id, sources, user_id=user_id)
+    return await _process_response(response, conv, db, conversation_id, sources, user_id=user_id, org_id=org_id)
 
 
 async def _process_response(
     response, conv: Conversation, db: AsyncSession, conversation_id: str,
-    sources: list[dict], user_id: str = "",
+    sources: list[dict], user_id: str = "", org_id: str = "",
 ) -> dict:
     choice = response.choices[0]
     message = choice.message
@@ -328,7 +336,7 @@ async def _process_response(
         conv.pending_action = {"tool_use_block": tool_use_block}
 
         await audit.record(
-            db, user_id, audit.ACTION_TOOL_PROPOSED,
+            db, org_id, user_id, audit.ACTION_TOOL_PROPOSED,
             conversation_id=conversation_id, tool_name=tool_name,
             payload={"tool_id": tc.id, "arguments": tool_input, "description": description},
         )
@@ -428,6 +436,7 @@ async def _emit_final(
     content: str,
     tool_calls: list[dict],
     user_id: str = "",
+    org_id: str = "",
 ) -> AsyncGenerator[dict, None]:
     """Turn the streaming `_final` sentinel into a tool_proposal or message."""
     if tool_calls:
@@ -450,7 +459,7 @@ async def _emit_final(
         await _add_assistant_message(db, conversation_id, content, tool_call_objs)
         conv.pending_action = {"tool_use_block": {"id": tool_id, "name": tool_name, "input": tool_input}}
         await audit.record(
-            db, user_id, audit.ACTION_TOOL_PROPOSED,
+            db, org_id, user_id, audit.ACTION_TOOL_PROPOSED,
             conversation_id=conversation_id, tool_name=tool_name,
             payload={"tool_id": tool_id, "arguments": tool_input, "description": description},
         )
@@ -480,6 +489,7 @@ async def send_message_stream(
     message: str,
     db: AsyncSession,
     user_id: str = "",
+    org_id: str = "",
 ) -> AsyncGenerator[dict, None]:
     """Stream an agent turn over a WebSocket.
 
@@ -495,12 +505,12 @@ async def send_message_stream(
     and the turn pauses with a pending action stored on the conversation.
     """
     try:
-        conv = await _get_or_create_conversation(db, conversation_id, user_id)
+        conv = await _get_or_create_conversation(db, conversation_id, user_id, org_id)
         conversation_id = conv.id
         conv.pending_action = None
         await _add_user_message(db, conversation_id, message)
         history = await _load_messages(db, conversation_id)
-        context, sources = _build_context(message, user_id=user_id)
+        context, sources = _build_context(message, org_id=org_id)
         system_prompt = _build_system_prompt(context)
 
         yield {"type": "sources", "sources": sources, "conversation_id": conversation_id}
@@ -514,7 +524,7 @@ async def send_message_stream(
                 content = evt["content"]
                 tool_calls = evt["tool_calls"]
 
-        async for evt in _emit_final(conv, db, conversation_id, sources, content, tool_calls, user_id=user_id):
+        async for evt in _emit_final(conv, db, conversation_id, sources, content, tool_calls, user_id=user_id, org_id=org_id):
             yield evt
     except SQLAlchemyError:
         await db.rollback()
@@ -529,6 +539,7 @@ async def confirm_action_stream(
     approved: bool,
     db: AsyncSession,
     user_id: str = "",
+    org_id: str = "",
 ) -> AsyncGenerator[dict, None]:
     """Execute (or decline) a proposed tool and stream the agent's follow-up.
 
@@ -539,7 +550,11 @@ async def confirm_action_stream(
     """
     try:
         result = await db.execute(
-            select(Conversation).where(Conversation.id == conversation_id, Conversation.user_id == user_id)
+            select(Conversation).where(
+                Conversation.id == conversation_id,
+                Conversation.user_id == user_id,
+                Conversation.org_id == org_id,
+            )
         )
         conv = result.scalar_one_or_none()
         if not conv:
@@ -577,7 +592,7 @@ async def confirm_action_stream(
             audit_status = "declined"
 
         await audit.record(
-            db, user_id, audit_action,
+            db, org_id, user_id, audit_action,
             conversation_id=conversation_id, tool_name=tool_name,
             payload={"tool_id": tool_use_id, "arguments": tool_input, "result": tool_result},
             status=audit_status,
@@ -594,7 +609,7 @@ async def confirm_action_stream(
         }
 
         # Continue the agent loop with a fresh streaming turn.
-        async for evt in _continue_stream(conv, db, conversation_id, [], iteration=0, user_id=user_id):
+        async for evt in _continue_stream(conv, db, conversation_id, [], iteration=0, user_id=user_id, org_id=org_id):
             yield evt
     except SQLAlchemyError:
         await db.rollback()
@@ -607,6 +622,7 @@ async def confirm_action_stream(
 async def _continue_stream(
     conv: Conversation, db: AsyncSession, conversation_id: str,
     sources: list[dict], iteration: int, user_id: str = "",
+    org_id: str = "",
 ) -> AsyncGenerator[dict, None]:
     if iteration > AGENT_MAX_ITERATIONS:
         yield {
@@ -617,7 +633,7 @@ async def _continue_stream(
         }
         return
 
-    context, sources = _build_context("", user_id=user_id)
+    context, sources = _build_context("", org_id=org_id)
     system_prompt = _build_system_prompt(context)
     history = await _load_messages(db, conversation_id)
 
@@ -630,20 +646,26 @@ async def _continue_stream(
             content = evt["content"]
             tool_calls = evt["tool_calls"]
 
-    async for evt in _emit_final(conv, db, conversation_id, sources, content, tool_calls, user_id=user_id):
+    async for evt in _emit_final(conv, db, conversation_id, sources, content, tool_calls, user_id=user_id, org_id=org_id):
         yield evt
 
 
-async def _get_or_create_conversation(db: AsyncSession, conversation_id: str | None, user_id: str) -> Conversation:
+async def _get_or_create_conversation(
+    db: AsyncSession, conversation_id: str | None, user_id: str, org_id: str,
+) -> Conversation:
     if conversation_id:
         result = await db.execute(
-            select(Conversation).where(Conversation.id == conversation_id, Conversation.user_id == user_id)
+            select(Conversation).where(
+                Conversation.id == conversation_id,
+                Conversation.user_id == user_id,
+                Conversation.org_id == org_id,
+            )
         )
         conv = result.scalar_one_or_none()
         if conv is not None:
             return conv
     conversation_id = str(uuid.uuid4())
-    conv = Conversation(id=conversation_id, user_id=user_id)
+    conv = Conversation(id=conversation_id, user_id=user_id, org_id=org_id)
     db.add(conv)
     await db.flush()
     return conv
