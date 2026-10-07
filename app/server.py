@@ -15,7 +15,8 @@ from app.config import (
     CORS_ORIGINS, RATE_LIMIT, limiter,
     validate_config, SCHEDULE_ENABLED,
 )
-from app.auth import verify_token, AuthError
+from app.auth import AuthContext, AuthError
+from app.orgs import REVIEW_ROLES
 from app.api_v1 import router as v1_router, ingest_router
 
 structlog.configure(
@@ -58,17 +59,25 @@ app.include_router(v1_router)
 app.include_router(ingest_router)
 
 
-# --- backwards-compatible root routes (no auth) --------------------------
-# These mirror the v1 endpoints so existing clients/UIs keep working.
+# --- backwards-compatible root routes -------------------------------------
+# These mirror the v1 endpoints so existing clients/UIs keep working. The org
+# context is resolved from the token (org_id claim / X-Org-Id header), falling
+# back to the caller's personal org.
 
-def _user_id_from_header(authorization: str | None) -> str:
+async def _ctx_from_header(db: AsyncSession, authorization: str | None, x_org_id: str | None = None) -> AuthContext:
+    from app.deps import resolve_ctx_from_token
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Authorization Bearer token required")
     token = authorization.removeprefix("Bearer ").strip()
     try:
-        return verify_token(token)
+        return await resolve_ctx_from_token(db, token, x_org_id=x_org_id)
     except AuthError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
+
+
+def _require_reviewer(ctx: AuthContext):
+    if ctx.role not in REVIEW_ROLES:
+        raise HTTPException(status_code=403, detail=f"Requires role(s): {', '.join(REVIEW_ROLES)}")
 
 
 _STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "static")
@@ -146,54 +155,88 @@ from app.api_v1 import (  # noqa: E402
 
 @app.post("/synthesize")
 @limiter.limit(RATE_LIMIT)
-def synthesize_root(request: Request, authorization: str | None = Header(None)):
+async def synthesize_root(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    authorization: str | None = Header(None),
+    x_org_id: str | None = Header(None),
+):
     from app.skill_synthesis import synthesize as run_synthesis
-    user_id = _user_id_from_header(authorization)
-    return {"status": "ok", **run_synthesis(user_id=user_id)}
+    ctx = await _ctx_from_header(db, authorization, x_org_id)
+    _require_reviewer(ctx)
+    return {"status": "ok", "org_id": ctx.org_id, **run_synthesis(org_id=ctx.org_id)}
 
 
 @app.get("/skills")
-def list_skills_root(authorization: str | None = Header(None)):
+async def list_skills_root(
+    db: AsyncSession = Depends(get_db),
+    authorization: str | None = Header(None),
+    x_org_id: str | None = Header(None),
+):
     from app.skill_store import list_skills as ls
-    user_id = _user_id_from_header(authorization)
-    return {"skills": ls(user_id=user_id)}
+    ctx = await _ctx_from_header(db, authorization, x_org_id)
+    return {"skills": ls(org_id=ctx.org_id, only_approved=ctx.role not in REVIEW_ROLES)}
 
 
 @app.get("/skills/{skill_id}")
-def get_skill_root(skill_id: str, authorization: str | None = Header(None)):
+async def get_skill_root(
+    skill_id: str,
+    db: AsyncSession = Depends(get_db),
+    authorization: str | None = Header(None),
+    x_org_id: str | None = Header(None),
+):
     from app.skill_store import get_skill as gs
-    user_id = _user_id_from_header(authorization)
-    skill = gs(skill_id, user_id=user_id)
+    ctx = await _ctx_from_header(db, authorization, x_org_id)
+    skill = gs(org_id=ctx.org_id, skill_id=skill_id, only_approved=ctx.role not in REVIEW_ROLES)
     if skill is None:
         raise HTTPException(status_code=404, detail="Skill not found")
     return skill
 
 
 @app.put("/skills/{skill_id}")
-def update_skill_root(skill_id: str, req: UpdateSkillRequest, authorization: str | None = Header(None)):
+async def update_skill_root(
+    skill_id: str,
+    req: UpdateSkillRequest,
+    db: AsyncSession = Depends(get_db),
+    authorization: str | None = Header(None),
+    x_org_id: str | None = Header(None),
+):
     from app.skill_store import save_skill
-    user_id = _user_id_from_header(authorization)
-    save_skill(skill_id, req.content, user_id=user_id)
+    ctx = await _ctx_from_header(db, authorization, x_org_id)
+    _require_reviewer(ctx)
+    save_skill(org_id=ctx.org_id, skill_id=skill_id, body_content=req.content)
     return {"status": "ok"}
 
 
 @app.post("/skills/{skill_id}/approve")
-def approve_skill_root(skill_id: str, authorization: str | None = Header(None)):
+async def approve_skill_root(
+    skill_id: str,
+    db: AsyncSession = Depends(get_db),
+    authorization: str | None = Header(None),
+    x_org_id: str | None = Header(None),
+):
     from app.skill_store import approve_skill as approve
-    user_id = _user_id_from_header(authorization)
+    ctx = await _ctx_from_header(db, authorization, x_org_id)
+    _require_reviewer(ctx)
     try:
-        approve(skill_id, user_id=user_id)
+        approve(org_id=ctx.org_id, skill_id=skill_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     return {"status": "ok"}
 
 
 @app.post("/skills/{skill_id}/reject")
-def reject_skill_root(skill_id: str, authorization: str | None = Header(None)):
+async def reject_skill_root(
+    skill_id: str,
+    db: AsyncSession = Depends(get_db),
+    authorization: str | None = Header(None),
+    x_org_id: str | None = Header(None),
+):
     from app.skill_store import reject_skill as reject
-    user_id = _user_id_from_header(authorization)
+    ctx = await _ctx_from_header(db, authorization, x_org_id)
+    _require_reviewer(ctx)
     try:
-        reject(skill_id, user_id=user_id)
+        reject(org_id=ctx.org_id, skill_id=skill_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     return {"status": "ok"}
@@ -206,10 +249,13 @@ async def chat_root(
     req: ChatRequest,
     db: AsyncSession = Depends(get_db),
     authorization: str | None = Header(None),
+    x_org_id: str | None = Header(None),
 ):
     from app.agent import send_message
-    user_id = _user_id_from_header(authorization)
-    return await send_message(req.conversation_id, req.message, db, user_id=user_id)
+    ctx = await _ctx_from_header(db, authorization, x_org_id)
+    return await send_message(
+        req.conversation_id, req.message, db, user_id=ctx.user_id, org_id=ctx.org_id,
+    )
 
 
 @app.post("/chat/confirm")
@@ -219,10 +265,13 @@ async def chat_confirm_root(
     req: ConfirmRequest,
     db: AsyncSession = Depends(get_db),
     authorization: str | None = Header(None),
+    x_org_id: str | None = Header(None),
 ):
     from app.agent import confirm_action
-    user_id = _user_id_from_header(authorization)
-    return await confirm_action(str(req.conversation_id), req.approved, db, user_id=user_id)
+    ctx = await _ctx_from_header(db, authorization, x_org_id)
+    return await confirm_action(
+        str(req.conversation_id), req.approved, db, user_id=ctx.user_id, org_id=ctx.org_id,
+    )
 
 
 # WebSocket streaming for chat --------------------------------------------
@@ -233,8 +282,12 @@ async def ws_chat(ws: WebSocket):
 
     Authentication: the client may present its JWT either as a WebSocket
     subprotocol (first entry) or in the first message after connect:
-      {"action": "auth", "token": "<jwt>"}
+      {"action": "auth", "token": "<jwt>", "org_id": "org_..."}
     If neither yields a valid token the connection is closed with code 4401.
+
+    The org is resolved once at connect time: the token's org_id claim, else the
+    `org_id` field from the auth message, else the caller's personal org. A
+    membership is always verified; a non-member is closed with code 4403.
 
     Once authenticated the server listens for:
       {"action": "chat", "message": "...", "conversation_id": "..."}
@@ -248,18 +301,24 @@ async def ws_chat(ws: WebSocket):
       {"type": "message", ...}
       {"type": "error", "detail": "..."}
     """
+    from app.database import async_session
+    from app.deps import resolve_ctx_from_token
+
+    auth_org_hint: str | None = None
+
     # --- authenticate -----------------------------------------------------
     # Subprotocol auth: client passes the JWT as the first offered subprotocol.
     subprotocols = ws.headers.get("sec-websocket-protocol", "").split(",")
     sub_token = subprotocols[0].strip() if subprotocols else ""
     if sub_token:
         try:
-            user_id = verify_token(sub_token)
+            async with async_session() as db:
+                ctx = await resolve_ctx_from_token(db, sub_token)
             await ws.accept(subprotocol=sub_token)
         except AuthError as e:
             await ws.accept()
             await ws.send_json({"type": "error", "detail": e.detail})
-            await ws.close(code=4401)
+            await ws.close(code=4401 if e.status_code == 401 else 4403)
             return
     else:
         await ws.accept()
@@ -274,16 +333,18 @@ async def ws_chat(ws: WebSocket):
             await ws.close(code=4400)
             return
 
-        token = first.get("token") or first.get("action") == "auth" and first.get("token")
+        token = first.get("token")
         if not token:
             await ws.send_json({"type": "error", "detail": "Authentication required"})
             await ws.close(code=4401)
             return
+        auth_org_hint = first.get("org_id") or ws.headers.get("x-org-id")
         try:
-            user_id = verify_token(token)
+            async with async_session() as db:
+                ctx = await resolve_ctx_from_token(db, token, payload_org_hint=auth_org_hint)
         except AuthError as e:
             await ws.send_json({"type": "error", "detail": e.detail})
-            await ws.close(code=4401)
+            await ws.close(code=4401 if e.status_code == 401 else 4403)
             return
 
     # --- message loop -----------------------------------------------------
@@ -298,7 +359,7 @@ async def ws_chat(ws: WebSocket):
                 if not message:
                     await ws.send_json({"type": "error", "detail": "Missing 'message'"})
                     continue
-                await _ws_run_stream(ws, user_id, "chat", conversation_id=conversation_id, message=message)
+                await _ws_run_stream(ws, ctx, "chat", conversation_id=conversation_id, message=message)
 
             elif action == "tool_confirm":
                 tool_id = payload.get("tool_id")
@@ -308,7 +369,7 @@ async def ws_chat(ws: WebSocket):
                     await ws.send_json({"type": "error", "detail": "tool_confirm requires tool_id and conversation_id"})
                     continue
                 await _ws_run_stream(
-                    ws, user_id, "confirm",
+                    ws, ctx, "confirm",
                     conversation_id=conversation_id, approved=approved, tool_id=tool_id,
                 )
 
@@ -324,7 +385,7 @@ async def ws_chat(ws: WebSocket):
             pass
 
 
-async def _ws_run_stream(ws: WebSocket, user_id: str, kind: str, **kwargs):
+async def _ws_run_stream(ws: WebSocket, ctx: AuthContext, kind: str, **kwargs):
     """Drive a streaming agent generator and forward every event to the WS."""
     from app.agent import send_message_stream, confirm_action_stream
     from app.database import async_session
@@ -333,11 +394,13 @@ async def _ws_run_stream(ws: WebSocket, user_id: str, kind: str, **kwargs):
         try:
             if kind == "chat":
                 gen = send_message_stream(
-                    kwargs.get("conversation_id"), kwargs.get("message", ""), db, user_id=user_id,
+                    kwargs.get("conversation_id"), kwargs.get("message", ""), db,
+                    user_id=ctx.user_id, org_id=ctx.org_id,
                 )
             else:
                 gen = confirm_action_stream(
-                    str(kwargs.get("conversation_id")), bool(kwargs.get("approved")), db, user_id=user_id,
+                    str(kwargs.get("conversation_id")), bool(kwargs.get("approved")), db,
+                    user_id=ctx.user_id, org_id=ctx.org_id,
                 )
             async for evt in gen:
                 await ws.send_json(evt)
