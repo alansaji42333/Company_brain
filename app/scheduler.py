@@ -11,13 +11,17 @@ independently. SCHEDULE_USER_ID is only the acting user recorded for
 provenance on those jobs.
 """
 import logging
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+
 from app.config import (
-    SCHEDULE_ENABLED, SCHEDULE_INGEST_CRON, SCHEDULE_SYNTHESIS_CRON,
+    SCHEDULE_ENABLED,
+    SCHEDULE_INGEST_CRON,
+    SCHEDULE_SYNTHESIS_CRON,
     SCHEDULE_USER_ID,
 )
-from app.database import SessionLocal
+from app.database import async_session as SessionLocal
 from app.orgs import list_all_org_ids
 
 logger = logging.getLogger(__name__)
@@ -64,6 +68,22 @@ async def _enqueue_for_all_orgs(function: str, **kwargs):
     logger.info("Scheduler enqueued %s for %d org(s)", function, len(org_ids))
 
 
+# --- registered scheduled jobs --------------------------------------------
+# NOTE: these MUST be coroutine functions — AsyncIOScheduler awaits them. A
+# sync lambda returning a coroutine is never awaited, so the job silently
+# never runs (this exact bug existed before: add_job(lambda: _enqueue...)).
+async def _scheduled_drive_ingest():
+    await _enqueue_for_all_orgs("ingest_drive", folder_id=None)
+
+
+async def _scheduled_slack_ingest():
+    await _enqueue_for_all_orgs("ingest_slack")
+
+
+async def _scheduled_synthesis():
+    await _enqueue_for_all_orgs("synthesize")
+
+
 def start_scheduler(app=None):
     global _scheduler
     if not SCHEDULE_ENABLED:
@@ -76,19 +96,19 @@ def start_scheduler(app=None):
 
     _scheduler = AsyncIOScheduler()
     _scheduler.add_job(
-        lambda: _enqueue_for_all_orgs("ingest_drive", folder_id=None),
+        _scheduled_drive_ingest,
         CronTrigger.from_crontab(SCHEDULE_INGEST_CRON),
         id="drive_ingest",
         replace_existing=True,
     )
     _scheduler.add_job(
-        lambda: _enqueue_for_all_orgs("ingest_slack"),
+        _scheduled_slack_ingest,
         CronTrigger.from_crontab(SCHEDULE_INGEST_CRON),
         id="slack_ingest",
         replace_existing=True,
     )
     _scheduler.add_job(
-        lambda: _enqueue_for_all_orgs("synthesize"),
+        _scheduled_synthesis,
         CronTrigger.from_crontab(SCHEDULE_SYNTHESIS_CRON),
         id="synthesis",
         replace_existing=True,
