@@ -22,6 +22,8 @@ ACTION_TOOL_DECLINED = "tool_declined"
 ACTION_SKILL_APPROVED = "skill_approved"
 ACTION_SKILL_REJECTED = "skill_rejected"
 ACTION_INGEST_SUMMARY = "ingest_summary"
+ACTION_CONNECTOR_SET = "connector_set"
+ACTION_CONNECTOR_DELETED = "connector_deleted"
 
 
 async def record(

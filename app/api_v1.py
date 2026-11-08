@@ -107,6 +107,17 @@ class IngestStatusResponse(BaseModel):
     result: dict | None = None
 
 
+class SlackConnectorRequest(BaseModel):
+    bot_token: str
+    channel_ids: list[str]
+
+
+class DriveConnectorRequest(BaseModel):
+    folder_id: str
+    credentials_json: dict
+    token_json: dict
+
+
 # --- routes --------------------------------------------------------------
 
 @router.post("/synthesize")
@@ -384,6 +395,94 @@ async def delete_org_member(
         raise HTTPException(status_code=status, detail=detail)
     await db.commit()
     return {"org_id": org_id, "user_id": user_id, "removed": True}
+
+
+# --- connectors (per-org credential onboarding) -----------------------------
+
+@router.get("/orgs/{org_id}/connectors")
+async def list_org_connectors(
+    org_id: str,
+    db: AsyncSession = Depends(get_db),
+    ctx: AuthContext = Depends(get_auth_context),
+):
+    """Non-secret view of the org's configured connectors (any member)."""
+    _require_member_of(ctx, org_id)
+    from app import connectors
+    org = await get_organization(db, org_id)
+    if org is None:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    return {"org_id": org_id, "connectors": await connectors.list_connectors_public(db, org_id)}
+
+
+@router.put("/orgs/{org_id}/connectors/slack")
+async def put_slack_connector(
+    org_id: str,
+    req: SlackConnectorRequest,
+    db: AsyncSession = Depends(get_db),
+    ctx: AuthContext = Depends(require_admin),
+):
+    """Store the org's Slack connector credentials (encrypted at rest)."""
+    _require_member_of(ctx, org_id)
+    from app import audit, connectors
+    org = await get_organization(db, org_id)
+    if org is None:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    config = req.model_dump()
+    try:
+        await connectors.set_connector(db, org_id, "slack", config, ctx.user_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    await db.commit()
+    # Audit records THAT a connector was set (actor + source) — never config.
+    await audit.record(db, org_id, ctx.user_id, audit.ACTION_CONNECTOR_SET, payload={"source": "slack"})
+    await db.commit()
+    return {"org_id": org_id, "source": "slack", "configured": True}
+
+
+@router.put("/orgs/{org_id}/connectors/drive")
+async def put_drive_connector(
+    org_id: str,
+    req: DriveConnectorRequest,
+    db: AsyncSession = Depends(get_db),
+    ctx: AuthContext = Depends(require_admin),
+):
+    """Store the org's Google Drive connector credentials (encrypted at rest)."""
+    _require_member_of(ctx, org_id)
+    from app import audit, connectors
+    org = await get_organization(db, org_id)
+    if org is None:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    config = req.model_dump()
+    try:
+        await connectors.set_connector(db, org_id, "drive", config, ctx.user_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    await db.commit()
+    await audit.record(db, org_id, ctx.user_id, audit.ACTION_CONNECTOR_SET, payload={"source": "drive"})
+    await db.commit()
+    return {"org_id": org_id, "source": "drive", "configured": True}
+
+
+@router.delete("/orgs/{org_id}/connectors/{source}")
+async def delete_org_connector(
+    org_id: str,
+    source: str,
+    db: AsyncSession = Depends(get_db),
+    ctx: AuthContext = Depends(require_admin),
+):
+    """Delete the org's connector config; ingest falls back to env behavior."""
+    _require_member_of(ctx, org_id)
+    from app import audit, connectors
+    try:
+        removed = await connectors.delete_connector(db, org_id, source)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not removed:
+        raise HTTPException(status_code=404, detail=f"No {source} connector configured")
+    await db.commit()
+    await audit.record(db, org_id, ctx.user_id, audit.ACTION_CONNECTOR_DELETED, payload={"source": source})
+    await db.commit()
+    return {"org_id": org_id, "source": source, "removed": True}
 
 
 def _require_member_of(ctx: AuthContext, org_id: str):
