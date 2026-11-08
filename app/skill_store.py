@@ -116,9 +116,16 @@ def save_skill(org_id: str, skill_id: str, body_content: str):
     path = os.path.join(_org_dir(org_id), f"{skill_id}.md")
     now = _now_iso()
 
+    needs_reapproval = False
     if os.path.exists(path):
         with open(path) as f:
             post = frontmatter.load(f)
+        if post.get("status") == "approved":
+            # An edit to an approved skill bypasses review: demote to draft and
+            # remove the stale embedded vector so it can no longer be
+            # retrieved until it is re-approved.
+            needs_reapproval = True
+            post["status"] = "draft"
         post.content = body_content
         post["updated_at"] = now
     else:
@@ -132,6 +139,10 @@ def save_skill(org_id: str, skill_id: str, body_content: str):
 
     with open(path, "w") as f:
         f.write(frontmatter.dumps(post))
+
+    if needs_reapproval:
+        delete_by_ids([_skill_stored_id(org_id, skill_id)], collection=COLLECTION_SKILLS)
+        logger.info("Demoted edited approved skill to draft: %s", skill_id)
 
 
 def create_skill(org_id: str, title: str, summary: str, steps: list[str], source_chunk_ids: list[str]) -> str:

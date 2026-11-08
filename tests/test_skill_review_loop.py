@@ -56,3 +56,37 @@ def test_reject_deletes_exactly_the_vector_approve_embedded(skills_env):
     )
 
 
+def test_editing_approved_skill_demotes_to_draft_and_deletes_vector(skills_env):
+    skill_store, _added, deleted = skills_env
+
+    from app.vectorstore import stored_chunk_id
+
+    skill_id = skill_store.create_skill("org_tenant1", "Deploy Steps", "summary", ["step 1"], [])
+    skill_store.approve_skill("org_tenant1", skill_id)
+    assert skill_store.get_skill("org_tenant1", skill_id)["status"] == "approved"
+
+    deleted.clear()
+
+    skill_store.save_skill("org_tenant1", skill_id, "NEW BODY CONTENT")
+
+    skill = skill_store.get_skill("org_tenant1", skill_id)
+    assert skill["status"] == "draft"
+    assert skill["content"] == "NEW BODY CONTENT"
+    assert len(deleted) == 1
+    assert deleted[0][1] == [stored_chunk_id("org_tenant1", f"skill_org_tenant1_{skill_id}", 0)]
+
+
+def test_reapproving_edited_skill_embeds_new_text(skills_env):
+    skill_store, added, _deleted = skills_env
+
+    skill_id = skill_store.create_skill("org_tenant1", "Run Report", "old summary", ["old"], [])
+    skill_store.approve_skill("org_tenant1", skill_id)
+    skill_store.save_skill("org_tenant1", skill_id, "This is the NEW patched text")
+    skill_store.approve_skill("org_tenant1", skill_id)
+
+    # Two approve calls → two embeddings; the second must carry the new text.
+    assert len(added) == 2
+    new_chunks = added[1][2]
+    assert len(new_chunks) == 1
+    assert "NEW patched text" in new_chunks[0]["text"]
+    assert "old summary" not in new_chunks[0]["text"]
