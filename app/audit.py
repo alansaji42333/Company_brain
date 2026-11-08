@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 # Canonical action_type values (validated by convention, not an enum, so the
 # column stays a plain indexed string for portability).
 ACTION_TOOL_PROPOSED = "tool_proposed"
+ACTION_TOOL_EXECUTING = "tool_executing"  # committed before the tool runs; no matching tool_confirmed = outcome unknown
 ACTION_TOOL_CONFIRMED = "tool_confirmed"
 ACTION_TOOL_DECLINED = "tool_declined"
 ACTION_SKILL_APPROVED = "skill_approved"

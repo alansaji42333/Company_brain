@@ -233,7 +233,7 @@ async def confirm_action(conversation_id: str, approved: bool, db: AsyncSession,
                 Conversation.id == conversation_id,
                 Conversation.user_id == user_id,
                 Conversation.org_id == org_id,
-            )
+            ).with_for_update()
         )
         conv = result.scalar_one_or_none()
         if not conv:
@@ -251,8 +251,17 @@ async def confirm_action(conversation_id: str, approved: bool, db: AsyncSession,
         tool_use_id = tool_block["id"]
 
         if approved:
+            # Commit the audit row and the cleared pending action before the
+            # side effect: the attempt is always on record and can't be replayed.
+            await audit.record(
+                db, org_id, user_id, audit.ACTION_TOOL_EXECUTING,
+                conversation_id=conversation_id, tool_name=tool_name,
+                payload={"tool_id": tool_use_id, "arguments": tool_input},
+                status="started",
+            )
+            await db.commit()
             logger.info("Executing tool: %s", tool_name)
-            tool_result = execute_tool(tool_name, tool_input)
+            tool_result = await asyncio.to_thread(execute_tool, tool_name, tool_input)
             tool_result_content = (
                 f"Result: {tool_result.get('message', '')}"
                 if tool_result.get("success")
@@ -277,6 +286,7 @@ async def confirm_action(conversation_id: str, approved: bool, db: AsyncSession,
         )
 
         await _add_tool_result(db, conversation_id, tool_use_id, tool_result_content, is_error)
+        await db.commit()
 
         result = await _continue(conv, db, conversation_id, [], iteration=0, user_id=user_id, org_id=org_id)
         await db.commit()
@@ -554,7 +564,7 @@ async def confirm_action_stream(
                 Conversation.id == conversation_id,
                 Conversation.user_id == user_id,
                 Conversation.org_id == org_id,
-            )
+            ).with_for_update()
         )
         conv = result.scalar_one_or_none()
         if not conv:
@@ -573,8 +583,17 @@ async def confirm_action_stream(
         tool_use_id = tool_block["id"]
 
         if approved:
+            # Commit the audit row and the cleared pending action before the
+            # side effect: the attempt is always on record and can't be replayed.
+            await audit.record(
+                db, org_id, user_id, audit.ACTION_TOOL_EXECUTING,
+                conversation_id=conversation_id, tool_name=tool_name,
+                payload={"tool_id": tool_use_id, "arguments": tool_input},
+                status="started",
+            )
+            await db.commit()
             logger.info("Executing tool: %s", tool_name)
-            tool_result = execute_tool(tool_name, tool_input)
+            tool_result = await asyncio.to_thread(execute_tool, tool_name, tool_input)
             tool_result_content = (
                 f"Result: {tool_result.get('message', '')}"
                 if tool_result.get("success")
