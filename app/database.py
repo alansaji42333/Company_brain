@@ -2,7 +2,7 @@ import logging
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, Column, DateTime, ForeignKey, Integer, String, UniqueConstraint
+from sqlalchemy import JSON, Column, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, relationship
 
@@ -92,6 +92,28 @@ class AuditLog(Base):
     payload = Column(JSON, nullable=True)
     status = Column(String(16), nullable=False, default="success")
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+
+
+class OrgConnectorConfig(Base):
+    """Per-org connector credentials (Slack bot token, Google Drive OAuth),
+    stored ENCRYPTED at rest (Fernet ciphertext of the JSON config in
+    config_encrypted). Secrets are never returned by API reads (see
+    app/connectors.get_connector_public) and never logged or audited.
+
+    One row per (org_id, source). An org without a row for a source falls
+    back to the process-level env/file configuration, preserving the
+    single-tenant deployment behavior.
+    """
+    __tablename__ = "org_connector_configs"
+    __table_args__ = (UniqueConstraint("org_id", "source", name="uq_org_connector_org_source"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    org_id = Column(String, ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True)
+    source = Column(String(16), nullable=False)  # "slack" | "drive"
+    config_encrypted = Column(Text, nullable=False)
+    updated_by = Column(String, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc),
+                        onupdate=lambda: datetime.now(timezone.utc), nullable=False)
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
