@@ -205,6 +205,30 @@ def asyncio_run_job(coro_fn, ctx: dict, **kwargs) -> dict:
     return asyncio.run(coro_fn(ctx, **kwargs))
 
 
+def make_slack_chunks(channel_id: str, texts: list[str], org_id: str = ORG) -> list[dict]:
+    """Chunks for one channel in the shape conversation_to_chunks() yields."""
+    return [
+        make_chunk(f"slack_{channel_id}", i, text, org_id=org_id, doc_name=f"#{channel_id}")
+        for i, text in enumerate(texts)
+    ]
+
+
+def run_slack_ingest(monkeypatch, chunks_by_run: list[list[dict]], org_id: str = ORG) -> dict:
+    """Run the real `ingest_slack` worker job; each element of
+    `chunks_by_run` is what ingest_slack_channel "returns" on that run."""
+    from app import slack_ingest
+    from app.worker import ingest_slack
+
+    runs = iter(chunks_by_run)
+    monkeypatch.setattr(slack_ingest, "SLACK_CHANNEL_IDS", "C123")
+    monkeypatch.setattr(
+        slack_ingest, "ingest_slack_channel",
+        lambda cid, user_id="", org_id="": list(next(runs)),
+    )
+
+    return asyncio_run_job(ingest_slack, {}, user_id="scheduler", org_id=org_id)
+
+
 def test_unchanged_drive_doc_skipped_on_reingest(fake_store, monkeypatch):
     from app import vectorstore
     from app.chunking import content_hash
@@ -346,3 +370,73 @@ def test_org_A_sweep_never_touches_org_B_same_doc_id(fake_store, monkeypatch):
     assert remaining[0]["doc_id"] == shared_doc
     assert remaining[0]["org_id"] == "org_B"
     assert len(embed_calls) == n_embeds_before, "isolation sweep must not re-embed"
+
+
+# =====================================================================
+# 4. Slack: per-channel wholesale replace
+# =====================================================================
+
+def test_shrinking_slack_channel_leaves_no_orphan_chunks(fake_store, monkeypatch):
+    from app import vectorstore
+
+    collections, _embed_calls = fake_store
+    fake = collections[vectorstore.COLLECTION_NAME]
+
+    # Run 1: three chunks stored for the channel.
+    run_slack_ingest(monkeypatch, [make_slack_chunks("C123", ["window one", "window two", "window three"])])
+    old_ids = {cid for cid in fake.docs if "slack_C123" in cid}
+    assert len(old_ids) == 3
+
+    # Run 2: history shrank / windows regrouped — only ONE chunk now.
+    new_text = "the only surviving window"
+    result = run_slack_ingest(monkeypatch, [make_slack_chunks("C123", [new_text])])
+
+    assert result["channels"] == 1
+    assert result["chunks_stored"] == 1
+    assert result["chunks_deleted"] == 3, "all three old channel chunks must be deleted"
+
+    # Exactly the new chunk set remains — no orphaned higher-index chunks.
+    doc_chunks = fake.get(where={"org_id": ORG, "doc_id": "slack_C123"})
+    assert doc_chunks["ids"] == [vectorstore.stored_chunk_id(ORG, "slack_C123", 0)]
+    assert doc_chunks["documents"] == [new_text]
+    assert all("slack_C123" in cid for cid in fake.docs)
+
+    # Run 3: wholesale replace is unconditional — the old chunk is deleted
+    # again and the store still holds EXACTLY the new set.
+    result3 = run_slack_ingest(monkeypatch, [make_slack_chunks("C123", [new_text])])
+    assert result3["chunks_deleted"] == 1
+    assert result3["chunks_stored"] == 1
+    assert fake.get(where={"org_id": ORG, "doc_id": "slack_C123"})["ids"] == [
+        vectorstore.stored_chunk_id(ORG, "slack_C123", 0),
+    ]
+
+
+def test_slack_failed_channel_keeps_its_stored_chunks(fake_store, monkeypatch):
+    """A channel whose pipeline fails is skipped: its stored chunks are NOT
+    deleted-then-lost."""
+    from app import slack_ingest, vectorstore
+    from app.worker import ingest_slack
+
+    collections, _ = fake_store
+    fake = collections[vectorstore.COLLECTION_NAME]
+
+    runs = iter([make_slack_chunks("C_ok", ["fine"])])
+    monkeypatch.setattr(slack_ingest, "SLACK_CHANNEL_IDS", "C_ok, C_broken")
+    monkeypatch.setattr(slack_ingest, "ingest_slack_channel", lambda cid, user_id="", org_id="": list(next(runs)))
+
+    asyncio_run_job(ingest_slack, {}, user_id="scheduler", org_id=ORG)
+    assert fake.count() == 1
+
+    # Now the good channel produces new content and the broken one raises.
+    runs2 = iter([make_slack_chunks("C_ok", ["fine again"])])
+    monkeypatch.setattr(
+        slack_ingest, "ingest_slack_channel",
+        lambda cid, user_id="", org_id="": list(next(runs2)) if cid == "C_ok" else (_ for _ in ()).throw(RuntimeError("slack api down")),
+    )
+
+    result = asyncio_run_job(ingest_slack, {}, user_id="scheduler", org_id=ORG)
+
+    assert result["channels"] == 1, "the failed channel must not be counted"
+    assert fake.get(where={"org_id": ORG, "doc_id": "slack_C_broken"})["ids"] == []
+    remaining_ok = fake.get(where={"org_id": ORG, "doc_id": "slack_C_ok"})
+    assert remaining_ok["documents"] == ["fine again"], "good channel still replaced"

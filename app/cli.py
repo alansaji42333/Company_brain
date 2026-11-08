@@ -26,14 +26,24 @@ def cmd_ingest(args):
 
 
 def cmd_ingest_slack(args):
+    from app import vectorstore
     from app.slack_ingest import ingest_slack
-    from app.vectorstore import add_chunks
 
     user_id = args.user_id or "cli"
     org_id = _org_id(args)
-    chunks = ingest_slack(user_id=user_id, org_id=org_id)
-    add_chunks(chunks)
-    logger.info("Slack ingestion complete — %d chunk(s) stored for org %s", len(chunks), org_id)
+    per_channel = ingest_slack(user_id=user_id, org_id=org_id)
+    stored = deleted = 0
+    for channel_id, payload in per_channel.items():
+        vectorstore.add_chunks(payload["chunks"])
+        stored += len(payload["chunks"])
+        deleted += payload["chunks_deleted"]
+        logger.info(
+            "Channel %s: %d chunk(s) stored, %d old chunk(s) deleted", channel_id, len(payload["chunks"]), payload["chunks_deleted"],
+        )
+    logger.info(
+        "Slack ingestion complete — %d chunk(s) stored, %d deleted across %d channel(s) (org %s)",
+        stored, deleted, len(per_channel), org_id,
+    )
 
 
 def cmd_synthesize(args):

@@ -90,15 +90,33 @@ async def ingest_drive(
 
 
 async def ingest_slack(ctx: dict, user_id: str = "", org_id: str = "") -> dict:
-    """Ingest Slack channels: history → threads → chunk → embed → store."""
+    """Ingest Slack channels with WHOLESALE REPLACE per channel.
+
+    slack_ingest.ingest_slack deletes each channel's stored chunks
+    (slack_{channel_id}, org-scoped) and returns the fresh chunks; storing
+    them here completes the replace. This drops deleted messages,
+    regrouped conversation windows, and orphaned higher-index chunks in one
+    move.
+    """
+    from app import vectorstore
     from app.slack_ingest import ingest_slack as run_ingest
-    from app.vectorstore import add_chunks
 
     logger.info("job ingest_slack: org_id=%s user_id=%s", org_id, user_id)
-    chunks = run_ingest(user_id=user_id, org_id=org_id)
-    add_chunks(chunks)
-    logger.info("job ingest_slack done: %d chunks", len(chunks))
-    return {"chunks_stored": len(chunks)}
+    per_channel = run_ingest(user_id=user_id, org_id=org_id)
+
+    counts = {"channels": len(per_channel), "chunks_stored": 0, "chunks_deleted": 0}
+    for channel_id, payload in per_channel.items():
+        chunks = payload["chunks"]
+        vectorstore.add_chunks(chunks)
+        counts["chunks_stored"] += len(chunks)
+        counts["chunks_deleted"] += payload["chunks_deleted"]
+        logger.info(
+            "job ingest_slack: channel %s replaced (%d stored, %d deleted)",
+            channel_id, len(chunks), payload["chunks_deleted"],
+        )
+
+    logger.info("job ingest_slack done: %s", counts)
+    return counts
 
 
 async def synthesize(ctx: dict, user_id: str = "", org_id: str = "") -> dict:

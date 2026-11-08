@@ -7,6 +7,7 @@ from slack_sdk.errors import SlackApiError
 
 from app.chunking import chunk_document, token_count
 from app.config import CHUNK_SIZE, SLACK_BOT_TOKEN, SLACK_CHANNEL_IDS, SLACK_CONVERSATION_WINDOW_MINUTES
+from app.vectorstore import delete_by_doc_id
 
 logger = logging.getLogger(__name__)
 
@@ -286,7 +287,21 @@ def ingest_slack_channel(channel_id: str, user_id: str = "", org_id: str = "") -
     return all_chunks
 
 
-def ingest_slack(user_id: str = "", org_id: str = "") -> list[dict]:
+def ingest_slack(user_id: str = "", org_id: str = "") -> dict[str, dict]:
+    """Ingest every configured Slack channel with REPLACE semantics.
+
+    Returns ``{channel_id: {"chunks": [...], "chunks_deleted": n}}``: for each
+    channel the stored chunks of ``slack_{channel_id}`` (this org only) are
+    deleted BEFORE the fresh chunks are returned, and the caller is
+    responsible for storing them. Wholesale replace is the correct freshness
+    semantic for Slack because conversation windows regroup: a re-ingest can
+    legitimately produce fewer chunks, and orphaned higher-index chunks would
+    otherwise keep answering. Change detection by dialogue hash is not
+    attempted — regrouping makes it unreliable.
+
+    A channel whose pipeline fails is skipped entirely (its stored chunks are
+    left untouched rather than deleted-then-lost).
+    """
     channel_ids_str = SLACK_CHANNEL_IDS
     if not channel_ids_str:
         raise ValueError("SLACK_CHANNEL_IDS must be set in .env")
@@ -295,12 +310,14 @@ def ingest_slack(user_id: str = "", org_id: str = "") -> list[dict]:
     if not channel_ids:
         raise ValueError("SLACK_CHANNEL_IDS is empty")
 
-    all_chunks = []
+    result: dict[str, dict] = {}
     for cid in channel_ids:
         try:
             chunks = ingest_slack_channel(cid, user_id=user_id, org_id=org_id)
-            all_chunks.extend(chunks)
         except Exception as e:
             logger.error("Failed to ingest channel %s: %s", cid, e)
+            continue
+        chunks_deleted = delete_by_doc_id(f"slack_{cid}", org_id)
+        result[cid] = {"chunks": chunks, "chunks_deleted": chunks_deleted}
 
-    return all_chunks
+    return result
