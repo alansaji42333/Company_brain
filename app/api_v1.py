@@ -4,6 +4,7 @@ All data endpoints are org-scoped: the auth context dependency resolves the
 caller's (user_id, org_id, role) by verifying a real membership, and every
 query filters on that org_id. Role gates are applied with `require_role`.
 """
+import asyncio
 import logging
 from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel
@@ -161,7 +162,7 @@ async def approve_skill(
     from app.skill_store import approve_skill as approve
     from app import audit
     try:
-        approve(org_id=ctx.org_id, skill_id=skill_id)
+        await asyncio.to_thread(approve, org_id=ctx.org_id, skill_id=skill_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     await audit.record(db, ctx.org_id, ctx.user_id, audit.ACTION_SKILL_APPROVED, payload={"skill_id": skill_id})
@@ -178,7 +179,7 @@ async def reject_skill(
     from app.skill_store import reject_skill as reject
     from app import audit
     try:
-        reject(org_id=ctx.org_id, skill_id=skill_id)
+        await asyncio.to_thread(reject, org_id=ctx.org_id, skill_id=skill_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     await audit.record(db, ctx.org_id, ctx.user_id, audit.ACTION_SKILL_REJECTED, payload={"skill_id": skill_id})

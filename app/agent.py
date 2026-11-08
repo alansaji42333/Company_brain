@@ -210,10 +210,10 @@ async def send_message(conversation_id: str | None, message: str, db: AsyncSessi
         await _add_user_message(db, conversation_id, message)
 
         history = await _load_messages(db, conversation_id)
-        context, sources = _build_context(message, org_id=org_id)
+        context, sources = await asyncio.to_thread(_build_context, message, org_id=org_id)
         system_prompt = _build_system_prompt(context)
 
-        response = _call_llm(history, system=system_prompt, tools=TOOL_SCHEMAS, max_tokens=LLM_MAX_TOKENS)
+        response = await asyncio.to_thread(_call_llm, history, system=system_prompt, tools=TOOL_SCHEMAS, max_tokens=LLM_MAX_TOKENS)
 
         result = await _process_response(response, conv, db, conversation_id, sources, user_id=user_id, org_id=org_id)
         await db.commit()
@@ -311,11 +311,11 @@ async def _continue(
             "sources": sources,
         }
 
-    context, sources = _build_context("", org_id=org_id)
+    context, sources = await asyncio.to_thread(_build_context, "", org_id=org_id)
     system_prompt = _build_system_prompt(context)
     history = await _load_messages(db, conversation_id)
 
-    response = _call_llm(history, system=system_prompt, tools=TOOL_SCHEMAS, max_tokens=LLM_MAX_TOKENS)
+    response = await asyncio.to_thread(_call_llm, history, system=system_prompt, tools=TOOL_SCHEMAS, max_tokens=LLM_MAX_TOKENS)
 
     return await _process_response(response, conv, db, conversation_id, sources, user_id=user_id, org_id=org_id)
 
@@ -520,7 +520,7 @@ async def send_message_stream(
         conv.pending_action = None
         await _add_user_message(db, conversation_id, message)
         history = await _load_messages(db, conversation_id)
-        context, sources = _build_context(message, org_id=org_id)
+        context, sources = await asyncio.to_thread(_build_context, message, org_id=org_id)
         system_prompt = _build_system_prompt(context)
 
         yield {"type": "sources", "sources": sources, "conversation_id": conversation_id}
@@ -652,7 +652,7 @@ async def _continue_stream(
         }
         return
 
-    context, sources = _build_context("", org_id=org_id)
+    context, sources = await asyncio.to_thread(_build_context, "", org_id=org_id)
     system_prompt = _build_system_prompt(context)
     history = await _load_messages(db, conversation_id)
 

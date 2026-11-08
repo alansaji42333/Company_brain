@@ -1,4 +1,5 @@
 import os
+import asyncio
 import logging
 import structlog
 from contextlib import asynccontextmanager
@@ -91,8 +92,13 @@ def _read_static(filename: str) -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     validate_config()
-    from app.embeddings import _get_ef
-    _get_ef()
+    # Run a real embed: building the function alone doesn't download the model,
+    # which would otherwise happen during the first query.
+    from app.embeddings import embed
+    try:
+        embed(["warmup"])
+    except Exception as e:
+        logger.warning("embedding model warmup failed: %s", e)
 
     # Create the ARQ Redis pool and attach it to app state so endpoints can
     # enqueue background jobs via request.app.state.redis.enqueue_job(...).
@@ -164,7 +170,7 @@ async def synthesize_root(
     from app.skill_synthesis import synthesize as run_synthesis
     ctx = await _ctx_from_header(db, authorization, x_org_id)
     _require_reviewer(ctx)
-    return {"status": "ok", "org_id": ctx.org_id, **run_synthesis(org_id=ctx.org_id)}
+    return {"status": "ok", "org_id": ctx.org_id, **await asyncio.to_thread(run_synthesis, org_id=ctx.org_id)}
 
 
 @app.get("/skills")
@@ -222,7 +228,7 @@ async def approve_skill_root(
     ctx = await _ctx_from_header(db, authorization, x_org_id)
     _require_reviewer(ctx)
     try:
-        approve(org_id=ctx.org_id, skill_id=skill_id)
+        await asyncio.to_thread(approve, org_id=ctx.org_id, skill_id=skill_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     return {"status": "ok"}
@@ -239,7 +245,7 @@ async def reject_skill_root(
     ctx = await _ctx_from_header(db, authorization, x_org_id)
     _require_reviewer(ctx)
     try:
-        reject(org_id=ctx.org_id, skill_id=skill_id)
+        await asyncio.to_thread(reject, org_id=ctx.org_id, skill_id=skill_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     return {"status": "ok"}
