@@ -31,6 +31,13 @@ def _org_dir(org_id: str) -> str:
     return path
 
 
+def _skill_path(org_id: str, skill_id: str) -> str:
+    """Path of a skill file. Raises ValueError if skill_id isn't a plain file stem."""
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", skill_id):
+        raise ValueError("Invalid skill id")
+    return os.path.join(_org_dir(org_id), f"{skill_id}.md")
+
+
 def _list_files(org_id: str) -> list[str]:
     d = _org_dir(org_id)
     return sorted(
@@ -75,7 +82,10 @@ def list_skills(org_id: str = "", only_approved: bool = False) -> list[dict[str,
 
 
 def get_skill(org_id: str, skill_id: str, only_approved: bool = False) -> dict[str, Any] | None:
-    path = os.path.join(_org_dir(org_id), f"{skill_id}.md")
+    try:
+        path = _skill_path(org_id, skill_id)
+    except ValueError:
+        return None
     if not os.path.exists(path):
         return None
     try:
@@ -97,7 +107,7 @@ def get_skill(org_id: str, skill_id: str, only_approved: bool = False) -> dict[s
 
 
 def save_skill(org_id: str, skill_id: str, body_content: str):
-    path = os.path.join(_org_dir(org_id), f"{skill_id}.md")
+    path = _skill_path(org_id, skill_id)
     now = _now_iso()
 
     if os.path.exists(path):
@@ -146,7 +156,7 @@ def create_skill(org_id: str, title: str, summary: str, steps: list[str], source
 
 
 def approve_skill(org_id: str, skill_id: str):
-    path = os.path.join(_org_dir(org_id), f"{skill_id}.md")
+    path = _skill_path(org_id, skill_id)
     if not os.path.exists(path):
         raise ValueError(f"Skill {skill_id} not found")
 
@@ -175,7 +185,7 @@ def approve_skill(org_id: str, skill_id: str):
 
 
 def reject_skill(org_id: str, skill_id: str):
-    path = os.path.join(_org_dir(org_id), f"{skill_id}.md")
+    path = _skill_path(org_id, skill_id)
     if not os.path.exists(path):
         raise ValueError(f"Skill {skill_id} not found")
 

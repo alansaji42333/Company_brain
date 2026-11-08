@@ -145,7 +145,10 @@ def update_skill(
     ctx: AuthContext = Depends(require_role(*REVIEW_ROLES)),
 ):
     from app.skill_store import save_skill
-    save_skill(org_id=ctx.org_id, skill_id=skill_id, body_content=req.content)
+    try:
+        save_skill(org_id=ctx.org_id, skill_id=skill_id, body_content=req.content)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     return {"status": "ok"}
 
 

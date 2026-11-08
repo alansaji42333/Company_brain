@@ -204,7 +204,10 @@ async def update_skill_root(
     from app.skill_store import save_skill
     ctx = await _ctx_from_header(db, authorization, x_org_id)
     _require_reviewer(ctx)
-    save_skill(org_id=ctx.org_id, skill_id=skill_id, body_content=req.content)
+    try:
+        save_skill(org_id=ctx.org_id, skill_id=skill_id, body_content=req.content)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     return {"status": "ok"}
 
 
