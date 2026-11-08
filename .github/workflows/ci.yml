@@ -36,4 +36,8 @@ jobs:
           OLLAMA_BASE_URL: http://localhost:1
           LLM_MODEL: test-model
           DATABASE_URL: sqlite+aiosqlite:///test.db
+          # Test-only throwaway: connector credential encryption derives a
+          # dev-grade Fernet key from JWT_SECRET when CONNECTOR_SECRETS_KEY
+          # is unset (not a real secret, never matches production).
+          JWT_SECRET: ci-test-secret-not-for-prod
         run: pytest tests/ -v
