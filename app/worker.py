@@ -23,6 +23,24 @@ def redis_settings() -> RedisSettings:
     return RedisSettings.from_dsn(REDIS_URL)
 
 
+async def _audit_ingest_summary(org_id: str, user_id: str, payload: dict) -> None:
+    """Record one audit ingest_summary row per ingest job (best-effort).
+
+    Worker jobs run outside any request transaction, so this opens its own
+    session and commits. A failure to audit must not fail the ingest — log
+    and continue.
+    """
+    from app.audit import ACTION_INGEST_SUMMARY, record
+    from app.database import async_session
+
+    try:
+        async with async_session() as db:
+            await record(db, org_id, user_id, ACTION_INGEST_SUMMARY, payload=payload)
+            await db.commit()
+    except Exception as e:
+        logger.error("Failed to record ingest_summary audit for org %s: %s", org_id, e)
+
+
 # --- registered job functions ------------------------------------------
 # Each must accept the ARQ context (`ctx`) as the first argument.
 
@@ -85,6 +103,7 @@ async def ingest_drive(
             counts["deleted"] += 1
             logger.info("Swept deleted drive doc %s (org %s)", gone_doc_id, org_id)
 
+    await _audit_ingest_summary(org_id, user_id, {"source": "drive", **counts})
     logger.info("job ingest_drive done: %s", counts)
     return counts
 
@@ -115,6 +134,7 @@ async def ingest_slack(ctx: dict, user_id: str = "", org_id: str = "") -> dict:
             channel_id, len(chunks), payload["chunks_deleted"],
         )
 
+    await _audit_ingest_summary(org_id, user_id, {"source": "slack", **counts})
     logger.info("job ingest_slack done: %s", counts)
     return counts
 

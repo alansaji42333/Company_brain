@@ -440,3 +440,94 @@ def test_slack_failed_channel_keeps_its_stored_chunks(fake_store, monkeypatch):
     assert fake.get(where={"org_id": ORG, "doc_id": "slack_C_broken"})["ids"] == []
     remaining_ok = fake.get(where={"org_id": ORG, "doc_id": "slack_C_ok"})
     assert remaining_ok["documents"] == ["fine again"], "good channel still replaced"
+
+
+# =====================================================================
+# 6. Audit: one ingest_summary row per ingest job
+# =====================================================================
+
+@pytest.fixture
+def audit_db(monkeypatch, tmp_path):
+    """Point app.database at a tmp sqlite engine with the schema created."""
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from app import database
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'audit.db'}")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(database, "engine", engine)
+    monkeypatch.setattr(database, "async_session", session_factory)
+
+    async def _create():
+        async with engine.begin() as conn:
+            await conn.run_sync(database.Base.metadata.create_all)
+
+    asyncio.run(_create())
+    return database
+
+
+def _audit_rows(database, org_id: str) -> list:
+    from sqlalchemy import select
+
+    async def _query():
+        async with database.async_session() as db:
+            rows = await db.execute(
+                select(database.AuditLog).where(database.AuditLog.org_id == org_id)
+            )
+            return list(rows.scalars().all())
+
+    return asyncio.run(_query())
+
+
+def test_drive_ingest_writes_ingest_summary_audit_row(audit_db, fake_store, monkeypatch):
+    from app import audit
+
+    doc = make_drive_doc("file1", "Audit me.")
+    result = run_drive_ingest(monkeypatch, [doc])
+
+    rows = _audit_rows(audit_db, ORG)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.action_type == audit.ACTION_INGEST_SUMMARY
+    assert row.org_id == ORG
+    assert row.user_id == "scheduler"
+    assert row.payload == {"source": "drive", **result}
+    assert row.status == "success"
+
+
+def test_slack_ingest_writes_ingest_summary_audit_row(audit_db, fake_store, monkeypatch):
+    from app import (
+        audit,
+        vectorstore,  # noqa: F401 — fake store activation
+    )
+
+    run_slack_ingest(
+        monkeypatch, [make_slack_chunks("C123", ["dialogue", "more dialogue"])],
+    )
+
+    rows = _audit_rows(audit_db, ORG)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.action_type == audit.ACTION_INGEST_SUMMARY
+    assert row.payload["source"] == "slack"
+    assert row.payload["channels"] == 1
+    assert row.payload["chunks_stored"] == 2
+    assert row.payload["chunks_deleted"] == 0
+
+
+def test_audit_failure_does_not_fail_the_ingest(audit_db, fake_store, monkeypatch):
+    """Best-effort audit: a broken DB must not fail the ingest job."""
+    real_session_factory = audit_db.async_session
+
+    async def broken_session(*a, **kw):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(audit_db, "async_session", broken_session)
+
+    result = run_drive_ingest(monkeypatch, [make_drive_doc("file1", "Audit me anyway.")])
+
+    assert result["ingested"] == 1  # the ingest itself still succeeded
+
+    # Restore the working session for verification: no audit row was written.
+    audit_db.async_session = real_session_factory
+    assert _audit_rows(audit_db, ORG) == []
