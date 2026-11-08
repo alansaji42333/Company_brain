@@ -666,7 +666,9 @@ def test_api_roundtrip(api_env):
     assert "API-CS" not in body and "API-RT" not in body
     assert any(c["source"] == "drive" and c["folder_id"] == "F-API" for c in res.json()["connectors"])
 
-    # DELETE removes the row; subsequent resolution falls back to env.
+    # DELETE removes the row; the org becomes UNCONFIGURED: its ingest jobs
+    # stop before any source/vector work, unless the org is the explicitly
+    # bound LEGACY_CONNECTOR_ORG_ID (covered by the dedicated legacy tests).
     res = client.delete(f"/api/v1/orgs/{org_id}/connectors/drive", headers=headers_boss)
     assert res.status_code == 200, res.text
     assert res.json()["removed"] is True
@@ -703,3 +705,570 @@ def test_api_roundtrip(api_env):
     assert ("connector_deleted", {"source": "drive"}) in audit_rows
     for _action, payload in audit_rows:
         assert SECRET_TOKEN not in json.dumps(payload or {})
+
+
+# =====================================================================
+# 9. Session 3.1 regressions: global credentials bind to ONE legacy org
+# =====================================================================
+# Contract: org config wins; env/file credentials are available ONLY to the
+# explicitly bound, non-empty LEGACY_CONNECTOR_ORG_ID. Every other org stops
+# before authentication, source fetching, embedding, vector storage,
+# replacement, or deletion sweeps — via HTTP-queued AND scheduler-queued
+# jobs, after DB-load failures, after connector deletion, and for corrupt
+# stored configs.
+
+LEGACY_ORG = "org_legacy_bound"
+GLOBAL_SLACK_TOKEN = "xoxb-GLOBAL-DISTINCT"
+GLOBAL_SLACK_CHANNELS = "C-GLOBAL-1,C-GLOBAL-2"
+GLOBAL_DRIVE_FOLDER = "F-GLOBAL-DISTINCT"
+
+
+def _bind_legacy(monkeypatch, org_id: str | None) -> None:
+    """Explicitly bind the legacy org with distinctive global credentials."""
+    from app import connectors as c
+    monkeypatch.setattr(c, "LEGACY_CONNECTOR_ORG_ID", org_id or "")
+    monkeypatch.setattr(c, "SLACK_BOT_TOKEN", GLOBAL_SLACK_TOKEN)
+    monkeypatch.setattr(c, "SLACK_CHANNEL_IDS", GLOBAL_SLACK_CHANNELS)
+    monkeypatch.setattr(c, "GOOGLE_DRIVE_FOLDER_ID", GLOBAL_DRIVE_FOLDER)
+
+
+@pytest.fixture
+def destructive_spies(fake_store, monkeypatch):
+    """Spy on every destructive/vector seam, passing through to the fake
+    store: slack's per-channel delete, vectorstore deletes, chunk storage,
+    plus embeddings (via fake_store's embed recorder)."""
+    from app import slack_ingest, vectorstore
+
+    calls = {"slack_deletes": [], "vector_deletes": [], "add_chunks": []}
+    embed_calls = fake_store[1]
+
+    real_delete = vectorstore.delete_by_doc_id
+
+    def spy_delete(doc_id, org_id):
+        calls["vector_deletes"].append((doc_id, org_id))
+        return real_delete(doc_id, org_id)
+
+    monkeypatch.setattr(vectorstore, "delete_by_doc_id", spy_delete)
+    # slack_ingest bound its own name at import time — patch that binding too.
+    monkeypatch.setattr(slack_ingest, "delete_by_doc_id", spy_delete)
+
+    real_add = vectorstore.add_chunks
+
+    def spy_add(chunks):
+        calls["add_chunks"].append(len(chunks))
+        return real_add(chunks)
+
+    monkeypatch.setattr(vectorstore, "add_chunks", spy_add)
+    return calls, embed_calls
+
+
+def _seed_org_vectors(vectorstore_module, fake, org_id: str, doc_id: str, source_type: str) -> None:
+    """Pre-seed the org's stored chunks so a false empty listing can never
+    wipe them silently."""
+    for i in range(2):
+        fake.docs[vectorstore_module.stored_chunk_id(org_id, doc_id, i)] = {
+            "document": f"seeded {source_type} chunk {i} for {org_id}",
+            "metadata": {
+                "doc_id": doc_id, "org_id": org_id, "source_type": source_type,
+                "chunk_index": i, "content_hash": "seed-hash",
+            },
+        }
+
+
+def _snapshot_vector_state(collections, spies, embed_calls) -> dict:
+    from app import vectorstore
+    return {
+        "docs": dict(collections[vectorstore.COLLECTION_NAME].docs),
+        "embed_calls": len(embed_calls),
+        "spies": {k: list(v) for k, v in spies.items()},
+    }
+
+
+def _assert_vector_state_untouched(collections, spies, embed_calls, before: dict) -> None:
+    from app import vectorstore
+    assert {k: list(v) for k, v in spies.items()} == before["spies"], "no new delete/store calls allowed"
+    assert len(embed_calls) == before["embed_calls"], "a rejected job must never embed"
+    assert dict(collections[vectorstore.COLLECTION_NAME].docs) == before["docs"]
+
+
+class _FakeArqJob:
+    def __init__(self, job_id: str):
+        self.job_id = job_id
+
+
+class _FakeArqPool:
+    """Enough of arq.ArqRedis for app.jobs' enqueue path (shape copied from
+    tests/test_ingest_jobs.py)."""
+
+    def __init__(self):
+        self.enqueued = []  # (function, kwargs)
+
+    async def enqueue_job(self, function, _job_id=None, **kwargs):
+        self.enqueued.append((function, kwargs))
+        return _FakeArqJob(f"job-{len(self.enqueued)}")
+
+    async def hset(self, key, mapping=None):
+        return True
+
+
+def _execute_queued_worker_job(pool, index: int) -> dict:
+    """Execute the REAL worker function the fake pool queued."""
+    from app import worker as worker_module
+    function, job_kwargs = pool.enqueued[index]
+    assert function in ("ingest_drive", "ingest_slack")
+    return asyncio.run(getattr(worker_module, function)({}, **job_kwargs))
+
+
+# --- resolver-level contract ------------------------------------------------
+
+def test_binding_is_the_only_authority_for_env_credentials(monkeypatch):
+    """Blank binding authorizes NOBODY (including an empty requesting id);
+    a folder override is not authority; exactly the bound org passes."""
+    from app import connectors as c
+    _bind_legacy(monkeypatch, None)  # unset/blank binding
+
+    with pytest.raises(ValueError, match=r"no slack connector configured for org org_any"):
+        c.resolve_slack_config("org_any", None)
+    with pytest.raises(ValueError, match="no slack connector configured"):
+        c.resolve_slack_config("", None)  # empty requesting org id
+    with pytest.raises(ValueError, match=r"no drive connector configured for org org_any"):
+        c.resolve_drive_config("org_any", None, "F-SUPPLIED-OVERRIDE")  # override ≠ authority
+
+    # Exactly the bound org passes — through the same centralized gate.
+    _bind_legacy(monkeypatch, LEGACY_ORG)
+    token, ids = c.resolve_slack_config(LEGACY_ORG, None)
+    assert (token, ids) == (GLOBAL_SLACK_TOKEN, ["C-GLOBAL-1", "C-GLOBAL-2"])
+    folder, creds, tok = c.resolve_drive_config(LEGACY_ORG, None, "F-SUPPLIED-OVERRIDE")
+    assert (folder, creds, tok) == ("F-SUPPLIED-OVERRIDE", None, None)
+    # ... while a DIFFERENT org with the same override still fails closed.
+    with pytest.raises(ValueError, match="no drive connector configured"):
+        c.resolve_drive_config("org_other", None, "F-SUPPLIED-OVERRIDE")
+
+    # A PRESENT but invalid stored config raises — it must never drop onto
+    # global credentials.
+    with pytest.raises(ValueError, match="empty bot_token"):
+        c.resolve_slack_config("org_bad", {"bot_token": "", "channel_ids": ["C1"]})
+    with pytest.raises(ValueError, match="empty folder_id"):
+        c.resolve_drive_config("org_bad", {"folder_id": "", "credentials_json": {"x": 1}, "token_json": {"y": 2}})
+
+
+# --- HTTP-queued jobs for unconfigured org B --------------------------------
+
+async def _create_tenant_org(session_factory, name: str, owner: str) -> str:
+    async with session_factory() as db:
+        from app.orgs import create_org
+        org = await create_org(db, name=name, slug=None, owner_user_id=owner)
+        await db.commit()
+        return org["id"]
+
+
+def test_api_queued_b_drive_never_reaches_global_creds(api_env, fake_store, drive_env, destructive_spies, monkeypatch):
+    """HTTP-triggered drive job for unconfigured org B: the queued worker must
+    stop before authentication/listing — with AND without a folder override."""
+    client, session_factory = api_env
+    records, _sentinel = drive_env
+    spies, embed_calls = destructive_spies
+    collections, _ = fake_store
+    from app import config, vectorstore
+    from app.server import app
+
+    _bind_legacy(monkeypatch, LEGACY_ORG)  # A is bound; B is NOT
+    org_b = asyncio.run(_create_tenant_org(session_factory, "Org B", "bossB"))
+    headers = {"Authorization": f"Bearer {_token(config.JWT_SECRET, 'bossB', org_b)}"}
+
+    fake = collections[vectorstore.COLLECTION_NAME]
+    _seed_org_vectors(vectorstore, fake, org_b, "seed-doc-B", "drive")
+    before = _snapshot_vector_state(collections, spies, embed_calls)
+
+    pool = _FakeArqPool()
+    app.state.redis = pool
+
+    res = client.post("/api/ingest/drive", headers=headers)
+    assert res.status_code == 200, res.text
+    assert pool.enqueued == [("ingest_drive", {"folder_id": None, "org_id": org_b, "user_id": "bossB"})]
+    result = _execute_queued_worker_job(pool, 0)
+    assert result["error"] == f"no drive connector configured for org {org_b}"
+    assert result["files_processed"] == 0 and result["chunks_stored"] == 0
+    assert records["credentials_calls"] == [] and records["folders"] == [] and records["services"] == []
+    _assert_vector_state_untouched(collections, spies, embed_calls, before)
+
+    # A supplied folder override changes the folder, not the authority.
+    res = client.post("/api/ingest/drive", params={"folder_id": "B-SUPPLIED-OVERRIDE"}, headers=headers)
+    assert res.status_code == 200
+    result = _execute_queued_worker_job(pool, 1)
+    assert result["error"] == f"no drive connector configured for org {org_b}"
+    assert records["folders"] == [], "the override must never reach the source"
+    _assert_vector_state_untouched(collections, spies, embed_calls, before)
+
+
+def test_api_queued_b_slack_never_reaches_global_creds(api_env, fake_store, slack_env, destructive_spies, monkeypatch):
+    """HTTP-triggered slack job for unconfigured org B must never build a
+    WebClient with the global token or touch stored vectors."""
+    client, session_factory = api_env
+    _, FakeWebClient = slack_env
+    spies, embed_calls = destructive_spies
+    collections, _ = fake_store
+    from app import config, vectorstore
+    from app.server import app
+
+    _bind_legacy(monkeypatch, LEGACY_ORG)
+    org_b = asyncio.run(_create_tenant_org(session_factory, "Org B", "bossB"))
+    headers = {"Authorization": f"Bearer {_token(config.JWT_SECRET, 'bossB', org_b)}"}
+
+    fake = collections[vectorstore.COLLECTION_NAME]
+    _seed_org_vectors(vectorstore, fake, org_b, "slack_C-seed", "slack")
+    before = _snapshot_vector_state(collections, spies, embed_calls)
+
+    pool = _FakeArqPool()
+    app.state.redis = pool
+    res = client.post("/api/ingest/slack", headers=headers)
+    assert res.status_code == 200, res.text
+    assert pool.enqueued == [("ingest_slack", {"org_id": org_b, "user_id": "bossB"})]
+
+    result = _execute_queued_worker_job(pool, 0)
+    assert result["error"] == f"no slack connector configured for org {org_b}"
+    assert result["channels"] == 0 and result["chunks_stored"] == 0 and result["chunks_deleted"] == 0
+    assert FakeWebClient.constructed == [], "the global token must never construct a WebClient for B"
+    _assert_vector_state_untouched(collections, spies, embed_calls, before)
+
+
+# --- scheduled jobs for unconfigured org B ----------------------------------
+
+@pytest.fixture
+def scheduler_seams(monkeypatch):
+    """Fake scheduler session/pool seams (pattern of
+    tests/test_scheduler_registry.py): two orgs, A bound + B unconfigured."""
+    from app import scheduler
+
+    class _FakeSchedSession:
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, *exc):
+            return False
+
+    async def fake_list_all_org_ids(db):
+        return [LEGACY_ORG, "org_B_sched"]
+
+    pool = _FakeArqPool()
+    monkeypatch.setattr(scheduler, "SessionLocal", lambda: _FakeSchedSession())
+    monkeypatch.setattr(scheduler, "list_all_org_ids", fake_list_all_org_ids)
+    monkeypatch.setattr(scheduler, "_pool", pool)
+    return scheduler, pool
+
+
+def test_scheduled_b_drive_never_reaches_global_creds(
+    tenant_db, fake_store, drive_env, destructive_spies, scheduler_seams, monkeypatch,
+):
+    """The scheduler fans out to A and B; executing B's queued job must be a
+    full rejection — enqueue-only assertions would not prove this."""
+    scheduler, pool = scheduler_seams
+    records, _sentinel = drive_env
+    spies, embed_calls = destructive_spies
+    collections, _ = fake_store
+    from app import vectorstore
+    from app import worker as worker_module
+
+    _bind_legacy(monkeypatch, LEGACY_ORG)
+    fake = collections[vectorstore.COLLECTION_NAME]
+    _seed_org_vectors(vectorstore, fake, "org_B_sched", "seed-doc-B", "drive")
+    before = _snapshot_vector_state(collections, spies, embed_calls)
+
+    asyncio.run(scheduler._scheduled_drive_ingest())
+    assert [fn for fn, _ in pool.enqueued] == ["ingest_drive", "ingest_drive"], "fan-out reached both orgs"
+    b_kwargs = [kw for _, kw in pool.enqueued if kw["org_id"] == "org_B_sched"]
+    assert len(b_kwargs) == 1
+
+    result = asyncio.run(worker_module.ingest_drive({}, **b_kwargs[0]))
+    assert result["error"] == "no drive connector configured for org org_B_sched"
+    assert result["files_processed"] == 0 and result["chunks_stored"] == 0
+    assert records["credentials_calls"] == [] and records["folders"] == []
+    _assert_vector_state_untouched(collections, spies, embed_calls, before)
+
+
+def test_scheduled_b_slack_never_reaches_global_creds(
+    tenant_db, fake_store, slack_env, destructive_spies, scheduler_seams, monkeypatch,
+):
+    scheduler, pool = scheduler_seams
+    _, FakeWebClient = slack_env
+    spies, embed_calls = destructive_spies
+    collections, _ = fake_store
+    from app import vectorstore
+    from app import worker as worker_module
+
+    _bind_legacy(monkeypatch, LEGACY_ORG)
+    fake = collections[vectorstore.COLLECTION_NAME]
+    _seed_org_vectors(vectorstore, fake, "org_B_sched", "slack_C-seed", "slack")
+    before = _snapshot_vector_state(collections, spies, embed_calls)
+
+    asyncio.run(scheduler._scheduled_slack_ingest())
+    assert [fn for fn, _ in pool.enqueued] == ["ingest_slack", "ingest_slack"]
+    b_kwargs = [kw for _, kw in pool.enqueued if kw["org_id"] == "org_B_sched"]
+    assert len(b_kwargs) == 1
+
+    result = asyncio.run(worker_module.ingest_slack({}, **b_kwargs[0]))
+    assert result["error"] == "no slack connector configured for org org_B_sched"
+    assert result["channels"] == 0 and result["chunks_stored"] == 0 and result["chunks_deleted"] == 0
+    assert FakeWebClient.constructed == []
+    _assert_vector_state_untouched(collections, spies, embed_calls, before)
+
+
+# --- after admin deletion ---------------------------------------------------
+
+def test_after_admin_deletion_b_stops_before_global_creds(
+    api_env, fake_store, slack_env, destructive_spies, monkeypatch,
+):
+    """B's stored creds take precedence; once an admin deletes the connector,
+    B goes UNCONFIGURED — global env creds (bound to A) are never used."""
+    client, session_factory = api_env
+    _, FakeWebClient = slack_env
+    spies, embed_calls = destructive_spies
+    collections, _ = fake_store
+    from app import config, slack_ingest, vectorstore
+    from app import worker as worker_module
+
+    _bind_legacy(monkeypatch, LEGACY_ORG)
+    FakeWebClient.history["C-B1"] = [{"ts": "700.000", "user": "U2", "text": "org B dialogue"}]
+    monkeypatch.setattr(
+        slack_ingest, "ingest_slack_channel",
+        lambda cid, user_id="", org_id="": make_slack_chunks_for(cid, ["org B stored path"], org_id),
+    )
+
+    org_b = asyncio.run(_create_tenant_org(session_factory, "Org B", "bossB"))
+    headers = {"Authorization": f"Bearer {_token(config.JWT_SECRET, 'bossB', org_b)}"}
+
+    fake = collections[vectorstore.COLLECTION_NAME]
+    _seed_org_vectors(vectorstore, fake, org_b, "slack_C-seed", "slack")
+
+    # First: the stored connector is in force (precedence sanity).
+    res = client.put(
+        f"/api/v1/orgs/{org_b}/connectors/slack",
+        json={"bot_token": "xoxb-B-PRIMARY", "channel_ids": ["C-B1"]},
+        headers=headers,
+    )
+    assert res.status_code == 200, res.text
+    result = asyncio.run(worker_module.ingest_slack({}, user_id="bossB", org_id=org_b))
+    assert result["channels"] == 1
+    assert FakeWebClient.constructed == ["xoxb-B-PRIMARY"], "stored B creds beat the global env token"
+
+    before = _snapshot_vector_state(collections, spies, embed_calls)
+    constructed_before = list(FakeWebClient.constructed)
+
+    # Now delete B's connector through the admin API.
+    res = client.delete(f"/api/v1/orgs/{org_b}/connectors/slack", headers=headers)
+    assert res.status_code == 200, res.text
+
+    result = asyncio.run(worker_module.ingest_slack({}, user_id="bossB", org_id=org_b))
+    assert result["error"] == f"no slack connector configured for org {org_b}"
+    assert result["channels"] == 0 and result["chunks_stored"] == 0 and result["chunks_deleted"] == 0
+    assert FakeWebClient.constructed == constructed_before, "GLOBAL_SLACK_TOKEN must never be constructed for B"
+    assert GLOBAL_SLACK_TOKEN not in FakeWebClient.constructed
+    _assert_vector_state_untouched(collections, spies, embed_calls, before)
+
+
+# --- DB-load failures ---------------------------------------------------------
+
+def test_db_load_failure_fails_closed_for_unbound_org(
+    tenant_db, fake_store, slack_env, drive_env, destructive_spies, monkeypatch, caplog,
+):
+    """Unbound B + a failing connector DB-load: ERROR log identifying org and
+    source, the standardized no-connector error, and ZERO source/vector
+    effects — the failure must never authorize global credentials."""
+    import logging
+
+    from app import connectors as c
+    from app import vectorstore
+
+    _bind_legacy(monkeypatch, LEGACY_ORG)  # env creds exist, but B is not bound
+    _, FakeWebClient = slack_env
+    records, _sentinel = drive_env
+    spies, embed_calls = destructive_spies
+    collections, _ = fake_store
+
+    async def failing_load(db, org_id, source):
+        raise RuntimeError("boom-SENSITIVE-connection-details")
+
+    monkeypatch.setattr(c, "get_connector", failing_load)  # the DB-load boundary
+
+    fake = collections[vectorstore.COLLECTION_NAME]
+    _seed_org_vectors(vectorstore, fake, "org_b_down", "slack_C-seed", "slack")
+    _seed_org_vectors(vectorstore, fake, "org_b_down", "seed-doc-B", "drive")
+    before = _snapshot_vector_state(collections, spies, embed_calls)
+
+    with caplog.at_level(logging.ERROR):
+        slack_result = run_slack_job("org_b_down")
+    assert slack_result == {
+        "error": "no slack connector configured for org org_b_down",
+        "channels": 0, "chunks_stored": 0, "chunks_deleted": 0,
+    }
+    assert FakeWebClient.constructed == []
+    worker_errors = [r for r in caplog.records
+                     if r.levelno == logging.ERROR and "org_b_down" in r.getMessage()]
+    assert worker_errors, "an ERROR log identifying org + source must be emitted"
+
+    with caplog.at_level(logging.ERROR):
+        drive_result = run_drive_job("org_b_down")
+    assert drive_result == {
+        "error": "no drive connector configured for org org_b_down",
+        "files_processed": 0, "chunks_stored": 0,
+    }
+    assert records["credentials_calls"] == [] and records["folders"] == [] and records["services"] == []
+    _assert_vector_state_untouched(collections, spies, embed_calls, before)
+    # Raw exception text must never reach logs, results, or audit payloads.
+    assert not any("boom-SENSITIVE" in r.getMessage() for r in caplog.records)
+
+
+def test_db_load_failure_bound_legacy_org_keeps_fallback(
+    tenant_db, fake_store, slack_env, drive_env, monkeypatch,
+):
+    """A (explicitly bound): a store unavailability permits the env/file
+    fallback — but ONLY through the same centralized resolver gate."""
+    from app import connectors as c
+    from app import slack_ingest
+
+    _bind_legacy(monkeypatch, LEGACY_ORG)
+    _, FakeWebClient = slack_env
+    records, _sentinel = drive_env
+
+    async def failing_load(db, org_id, source):
+        raise RuntimeError("db unreachable")
+
+    monkeypatch.setattr(c, "get_connector", failing_load)
+
+    FakeWebClient.history["C-GLOBAL-1"] = [{"ts": "900.000", "user": "U1", "text": "fallback works"}]
+    monkeypatch.setattr(
+        slack_ingest, "ingest_slack_channel",
+        lambda cid, user_id="", org_id="": make_slack_chunks_for(cid, ["fallback dialogue"], org_id),
+    )
+
+    result = run_slack_job(LEGACY_ORG)
+    assert result["channels"] == 2 and result["chunks_stored"] == 2
+    assert FakeWebClient.constructed == [GLOBAL_SLACK_TOKEN], "env token used for the bound org"
+
+    result = run_drive_job(LEGACY_ORG)
+    assert result["ingested"] == 1
+    assert records["services"] == [None], "credentials=None → drive_ingest's file/env path for the bound org"
+    assert records["credentials_calls"] == [], "the headless per-org google_auth path is NOT used for legacy fallback"
+    assert records["folders"] == ["F-GLOBAL-DISTINCT"]
+
+
+# --- corrupt stored config ----------------------------------------------------
+
+def test_corrupt_stored_config_fails_closed_for_every_org(
+    tenant_db, fake_store, slack_env, drive_env, destructive_spies, monkeypatch,
+):
+    """A present-but-undecryptable row must fail closed — even for the bound
+    legacy org; it must never masquerade as an absent row."""
+    database, session_factory = tenant_db
+    from app import vectorstore
+
+    _bind_legacy(monkeypatch, LEGACY_ORG)
+    _, FakeWebClient = slack_env
+    records, _sentinel = drive_env
+    spies, embed_calls = destructive_spies
+    collections, _ = fake_store
+
+    org_c = "org_corrupt"
+
+    async def _seed():
+        async with session_factory() as db:
+            db.add(database.OrgConnectorConfig(
+                org_id=org_c, source="slack", config_encrypted="not-a-fernet-token", updated_by="boss",
+            ))
+            db.add(database.OrgConnectorConfig(
+                org_id=org_c, source="drive", config_encrypted="not-a-fernet-token", updated_by="boss",
+            ))
+            await db.commit()
+
+    asyncio.run(_seed())
+
+    fake = collections[vectorstore.COLLECTION_NAME]
+    _seed_org_vectors(vectorstore, fake, org_c, "slack_C-seed", "slack")
+    before = _snapshot_vector_state(collections, spies, embed_calls)
+
+    result = run_slack_job(org_c)
+    assert result["error"] == (
+        f"stored slack connector config for org {org_c} is corrupt or undecryptable; re-save the connector"
+    )
+    assert result["channels"] == 0 and result["chunks_stored"] == 0
+    assert FakeWebClient.constructed == []
+
+    result = run_drive_job(org_c)
+    assert result["error"] == (
+        f"stored drive connector config for org {org_c} is corrupt or undecryptable; re-save the connector"
+    )
+    assert records["credentials_calls"] == [] and records["folders"] == []
+    _assert_vector_state_untouched(collections, spies, embed_calls, before)
+
+
+# --- positive/negative controls -------------------------------------------------
+
+def test_legacy_bound_org_slack_ingests_with_global_creds(tenant_db, fake_store, slack_env, monkeypatch):
+    """Positive control: A's normal legacy Slack path ingests with the global
+    env credentials (no stored row; authorized through the binding alone)."""
+    from app import slack_ingest, vectorstore
+
+    _bind_legacy(monkeypatch, LEGACY_ORG)
+    _, FakeWebClient = slack_env
+    collections, _ = fake_store
+
+    FakeWebClient.history["C-GLOBAL-1"] = [{"ts": "800.000", "user": "U1", "text": "legacy slack"}]
+    monkeypatch.setattr(
+        slack_ingest, "ingest_slack_channel",
+        lambda cid, user_id="", org_id="": make_slack_chunks_for(cid, ["legacy dialogue"], org_id),
+    )
+
+    result = run_slack_job(LEGACY_ORG)
+    assert result["channels"] == 2 and result["chunks_stored"] == 2
+    assert FakeWebClient.constructed == [GLOBAL_SLACK_TOKEN]
+
+    metas = collections[vectorstore.COLLECTION_NAME].get(where={"org_id": LEGACY_ORG})["metadatas"]
+    assert len(metas) == 2
+
+
+def test_legacy_bound_org_drive_ingests_with_global_creds(tenant_db, fake_store, drive_env, monkeypatch):
+    """Positive control: A's Drive path uses file/env auth; a folder override
+    changes the folder but keeps that authority."""
+    records, _sentinel = drive_env
+    _bind_legacy(monkeypatch, LEGACY_ORG)
+
+    result = run_drive_job(LEGACY_ORG)
+    assert result["ingested"] == 1 and result["chunks_stored"] >= 1
+    assert records["services"] == [None], "credentials=None → file/env auth path for the bound org"
+    assert records["credentials_calls"] == [], "headless google_auth boundary untouched on the legacy path"
+    assert records["folders"] == [GLOBAL_DRIVE_FOLDER]
+
+    result = run_drive_job(LEGACY_ORG, folder_id="F-BY-REQUEST")
+    assert records["folders"] == [GLOBAL_DRIVE_FOLDER, "F-BY-REQUEST"], "override honored for the bound org"
+    assert records["services"] == [None, None], "override did not change authority"
+
+
+def test_legacy_bound_org_without_global_creds_clear_error(
+    tenant_db, fake_store, slack_env, drive_env, destructive_spies, monkeypatch,
+):
+    """A bound legacy org with MISSING global credentials still gets a clear
+    error — never a crash, never another org's credentials."""
+    from app import connectors as c
+
+    monkeypatch.setattr(c, "LEGACY_CONNECTOR_ORG_ID", LEGACY_ORG)
+    monkeypatch.setattr(c, "SLACK_BOT_TOKEN", "")
+    monkeypatch.setattr(c, "SLACK_CHANNEL_IDS", "")
+    monkeypatch.setattr(c, "GOOGLE_DRIVE_FOLDER_ID", "")
+    _, FakeWebClient = slack_env
+    records, _sentinel = drive_env
+    spies, _ = destructive_spies
+
+    result = run_slack_job(LEGACY_ORG)
+    assert result == {
+        "error": f"no slack connector configured for org {LEGACY_ORG}",
+        "channels": 0, "chunks_stored": 0, "chunks_deleted": 0,
+    }
+    assert FakeWebClient.constructed == []
+
+    result = run_drive_job(LEGACY_ORG)
+    assert result == {
+        "error": f"no drive connector configured for org {LEGACY_ORG}",
+        "files_processed": 0, "chunks_stored": 0,
+    }
+    assert records["credentials_calls"] == [] and records["folders"] == [] and records["services"] == []
+    assert all(not v for v in spies.values())
