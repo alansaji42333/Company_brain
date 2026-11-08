@@ -110,3 +110,5 @@ def validate_config():
         raise RuntimeError(f"Missing required config: {', '.join(missing)}")
     if AUTH0_ENABLED and not AUTH0_DOMAIN:
         raise RuntimeError("AUTH0_ENABLED is true but AUTH0_DOMAIN is not set")
+    if not AUTH0_ENABLED and not JWT_SECRET:
+        raise RuntimeError("No auth configured: set JWT_SECRET or enable AUTH0_ENABLED with AUTH0_DOMAIN")

@@ -109,15 +109,14 @@ def _decode_payload(token: str) -> dict:
         return _verify_auth0_token(token)
     if JWT_SECRET:
         return _verify_shared_secret_token(token)
-    logger.warning("No auth provider configured — treating raw token as user_id (dev mode)")
-    return {"sub": token}
+    raise AuthError("No auth provider configured", 500)
 
 
 def verify_token(token: str) -> str:
     """Verify a bearer token and return the user_id.
 
     Auth0 is used when enabled; otherwise falls back to HS256 shared-secret mode.
-    If neither is configured, the raw token is treated as the user_id (dev only).
+    If neither is configured, the token is rejected.
     """
     return str(_decode_payload(token).get("sub") or "")
 
