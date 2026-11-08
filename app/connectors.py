@@ -122,13 +122,14 @@ def _validate(source: str, config: dict) -> None:
 
 # --- persistence -----------------------------------------------------------
 
-def _row(db: AsyncSession, org_id: str, source: str) -> OrgConnectorConfig | None:
-    return db.execute(
+async def _row(db: AsyncSession, org_id: str, source: str) -> OrgConnectorConfig | None:
+    result = await db.execute(
         select(OrgConnectorConfig).where(
             OrgConnectorConfig.org_id == org_id,
             OrgConnectorConfig.source == source,
         )
-    ).scalar_one_or_none()
+    )
+    return result.scalar_one_or_none()
 
 
 async def set_connector(db: AsyncSession, org_id: str, source: str, config: dict, user_id: str) -> None:
@@ -138,7 +139,7 @@ async def set_connector(db: AsyncSession, org_id: str, source: str, config: dict
     uniqueness violations surface before the commit.
     """
     _validate(source, config)
-    row = _row(db, org_id, source)
+    row = await _row(db, org_id, source)
     if row is None:
         row = OrgConnectorConfig(org_id=org_id, source=source)
         db.add(row)
@@ -155,7 +156,7 @@ async def get_connector(db: AsyncSession, org_id: str, source: str) -> dict | No
     """
     if source not in SOURCES:
         raise ValueError(f"Unknown connector source: {source!r} (expected one of {SOURCES})")
-    row = _row(db, org_id, source)
+    row = await _row(db, org_id, source)
     if row is None:
         return None
     return _decrypt(row.config_encrypted)
@@ -178,7 +179,7 @@ async def get_connector_public(db: AsyncSession, org_id: str, source: str) -> di
         public["channel_ids"] = list(config.get("channel_ids") or [])
     else:
         public["folder_id"] = config.get("folder_id", "")
-    row = _row(db, org_id, source)
+    row = await _row(db, org_id, source)
     public["updated_at"] = row.updated_at
     public["updated_by"] = row.updated_by
     return public
@@ -198,7 +199,7 @@ async def delete_connector(db: AsyncSession, org_id: str, source: str) -> bool:
     """Remove the org's connector config for `source`. True if a row existed."""
     if source not in SOURCES:
         raise ValueError(f"Unknown connector source: {source!r} (expected one of {SOURCES})")
-    row = _row(db, org_id, source)
+    row = await _row(db, org_id, source)
     if row is None:
         return False
     await db.delete(row)

@@ -12,8 +12,11 @@ logger = logging.getLogger(__name__)
 Document = dict[str, Any]
 
 
-def get_drive_service():
-    creds = get_credentials()
+def get_drive_service(credentials=None):
+    """Build the Drive API client. `credentials=None` resolves credentials the
+    original way (token.json / credentials.json / GOOGLE_* env, possibly an
+    interactive flow); worker jobs pass per-org `Credentials` explicitly."""
+    creds = credentials or get_credentials()
     return build("drive", "v3", credentials=creds)
 
 
@@ -105,13 +108,15 @@ def extract_text(file_info: dict, service) -> Document | None:
     }
 
 
-def ingest_drive_folder(folder_id: str | None = None, user_id: str = "", org_id: str = "") -> list[Document]:
+def ingest_drive_folder(
+    folder_id: str | None = None, user_id: str = "", org_id: str = "", credentials=None,
+) -> list[Document]:
     from app.config import GOOGLE_DRIVE_FOLDER_ID
     folder_id = folder_id or GOOGLE_DRIVE_FOLDER_ID
     if not folder_id:
         raise ValueError("GOOGLE_DRIVE_FOLDER_ID must be set in .env or passed as argument")
 
-    service = get_drive_service()
+    service = get_drive_service(credentials)
     files = list_files_in_folder(service, folder_id)
     logger.info("Found %d file(s) in Drive folder", len(files))
 

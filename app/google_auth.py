@@ -40,7 +40,57 @@ def _save_token(creds: Credentials):
         logger.info("Cannot write token file, using env-only mode")
 
 
-def get_credentials() -> Credentials:
+def get_credentials(
+    credentials_json: dict | None = None,
+    token_dict: dict | None = None,
+    on_token_refresh=None,
+) -> Credentials:
+    """Resolve Google OAuth credentials.
+
+    Zero-arg (or both dicts None) → the original single-tenant behavior:
+    token.json / credentials.json files, GOOGLE_* env vars, and — as a last
+    resort — the interactive InstalledAppFlow browser handshake.
+
+    With `token_dict` supplied (per-org connector): headless ONLY. The files,
+    env vars, and the interactive flow are NEVER touched (background workers
+    have no browser). The supplied token is refreshed when needed and
+    `on_token_refresh(new_token_dict)` is invoked on success so the caller can
+    persist it back to the org's connector row. A refresh failure raises a
+    clear, org-facing error (the fix is for an admin to reconnect Drive).
+    """
+    if token_dict is not None:
+        return _credentials_from_dicts(credentials_json, token_dict, on_token_refresh)
+    return _credentials_from_files()
+
+
+def _credentials_from_dicts(
+    credentials_json: dict, token_dict: dict | None, on_token_refresh,
+) -> Credentials:
+    creds = Credentials.from_authorized_user_info(token_dict, SCOPES) if token_dict else None
+    if creds and creds.valid:
+        return creds
+
+    if creds and creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+        except Exception as e:
+            raise RuntimeError(
+                "Could not refresh the org's stored Google Drive token — the "
+                "connection has likely been revoked or expired. Ask an org admin "
+                "to reconnect Drive (re-save the Drive connector)."
+            ) from e
+        if on_token_refresh is not None:
+            on_token_refresh(json.loads(creds.to_json()))
+        return creds
+
+    raise RuntimeError(
+        "The org's stored Google Drive token is present but not usable (no "
+        "refresh_token or already invalid). Ask an org admin to reconnect Drive "
+        "(re-save the Drive connector)."
+    )
+
+
+def _credentials_from_files() -> Credentials:
     creds = None
     token_dict = _get_token_dict()
     if token_dict:
