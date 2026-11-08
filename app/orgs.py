@@ -80,10 +80,10 @@ async def get_or_create_personal_org(db: AsyncSession, user_id: str) -> AuthCont
         name=f"{user_id}'s workspace",
         slug=personal_org_slug(user_id),
     ))
-    db.add(Membership(org_id=org_id, user_id=user_id, role=ROLE_ADMIN))
+    db.add(Membership(org_id=org_id, user_id=user_id, role=ROLE_MEMBER))
     await db.flush()
     logger.info("Created personal org %s for %s", org_id, user_id)
-    return AuthContext(user_id=user_id, org_id=org_id, role=ROLE_ADMIN)
+    return AuthContext(user_id=user_id, org_id=org_id, role=ROLE_MEMBER)
 
 
 async def resolve_auth_context(
