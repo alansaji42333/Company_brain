@@ -32,6 +32,12 @@ limiter = Limiter(key_func=_rate_limit_key)
 GOOGLE_DRIVE_FOLDER_ID: str = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "")
 SLACK_BOT_TOKEN: str = os.getenv("SLACK_BOT_TOKEN", "")
 SLACK_CHANNEL_IDS: str = os.getenv("SLACK_CHANNEL_IDS", "")
+# Legacy single-tenant credential binding: the ONLY org id (exact, non-empty)
+# permitted to use the global env/file connector credentials above when it has
+# no stored connector config. Empty authorizes NO org. See README ("Legacy
+# connector binding") — changing this requires restarting the API and worker
+# processes that consume this config.
+LEGACY_CONNECTOR_ORG_ID: str = os.getenv("LEGACY_CONNECTOR_ORG_ID", "")
 GOOGLE_SHEET_ID: str = os.getenv("GOOGLE_SHEET_ID", "")
 GOOGLE_SHEET_TAB: str = os.getenv("GOOGLE_SHEET_TAB", "Sheet1")
 DATABASE_URL: str = os.getenv("DATABASE_URL", "postgresql+asyncpg://company_brain:company_brain@db:5432/company_brain")

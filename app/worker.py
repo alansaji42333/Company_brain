@@ -41,29 +41,57 @@ async def _audit_ingest_summary(org_id: str, user_id: str, payload: dict) -> Non
         logger.error("Failed to record ingest_summary audit for org %s: %s", org_id, e)
 
 
-async def _load_org_connector(org_id: str, source: str) -> dict | None:
-    """Load and decrypt the org's connector config for `source` (None if absent).
+# Load-failure kinds returned by _load_org_connector (curated strings — safe
+# for logs, audit payloads and API-visible job results; never raw exception
+# text, config, or tokens).
+_LOAD_STORE_UNAVAILABLE = "connector store unavailable"
+_LOAD_CONFIG_CORRUPT = "stored connector config is corrupt or undecryptable"
+
+
+async def _load_org_connector(org_id: str, source: str) -> tuple[dict | None, str | None]:
+    """Load and decrypt the org's stored connector config for `source`.
+
+    Returns ``(org_cfg, failure)``:
+
+    - ``(config, None)`` — a present, decryptable stored config;
+    - ``(None, None)`` — the org genuinely has NO stored row;
+    - ``(None, failure)`` — the store could not be trusted:
+
+      * ``connector store unavailable`` — DB down or the table missing
+        (e.g. migration not yet applied). Only the explicitly bound legacy
+        org may fall back to env/file credentials, and ONLY through the
+        centralized resolver gate in app.connectors (which re-checks the
+        binding and env presence).
+      * ``stored connector config is corrupt or undecryptable`` — a
+        present-but-unreadable config must fail closed for EVERY org; it
+        must never masquerade as an absent row, which could authorize the
+        global-credential fallback.
 
     Runs inside its own short-lived session which is closed before any of the
-    (sync, potentially long) ingest work starts. Best-effort: if the DB is
-    unreachable or the table is missing (e.g. migration not yet applied, or
-    tests exercising the ingest seams without a DB), this degrades to None →
-    the caller falls back to the env/file behavior, matching how the process
-    always worked. Failures are logged loud (ERROR) so a silent wrong-tenant
-    fallback to global credentials is visible to operators.
+    (sync, potentially long) ingest work starts. Callers MUST treat a failure
+    as "stop before authentication, fetching, embedding, storage, or deletion".
     """
     from app import connectors
     from app.database import async_session
 
     try:
         async with async_session() as db:
-            return await connectors.get_connector(db, org_id, source)
-    except Exception as e:
+            return await connectors.get_connector(db, org_id, source), None
+    except ValueError:
+        # app.connectors signals an undecryptable stored config this way.
+        # Fail closed for every org — this is NOT "no stored row".
+        return None, _LOAD_CONFIG_CORRUPT
+    except Exception:
+        # No raw exception text here: the returned/logged kind is curated so a
+        # DB error can never smuggle secrets anywhere. Fall back to env
+        # credentials is permitted ONLY for the explicitly bound legacy org
+        # (the caller enforces this via the resolver gate).
         logger.error(
-            "Failed to load %s connector config for org %s (%s); falling back to env credentials",
-            source, org_id, e,
+            "Connector store load failed for org %s source %s (%s); only an "
+            "explicitly bound legacy org may fall back to env credentials",
+            org_id, source, _LOAD_STORE_UNAVAILABLE,
         )
-        return None
+        return None, _LOAD_STORE_UNAVAILABLE
 
 
 async def _persist_refreshed_drive_token(org_id: str, user_id: str, new_token_dict: dict) -> None:
@@ -104,9 +132,12 @@ async def ingest_drive(
     - gone from the folder listing → vectors deleted (`deleted`).
 
     Credentials: the org's stored connector (decrypted) if configured, else
-    the original env/file path. A missing connector in both places is NOT an
-    ARQ retry — it is a waiting-for-setup state, so the job reports an error
-    result instead of raising.
+    the process env/file path ONLY if this org is the explicitly bound
+    LEGACY_CONNECTOR_ORG_ID (enforced in app.connectors' resolver, checked
+    BEFORE any env inspection — a folder override does not grant authority).
+    A missing connector is NOT an ARQ retry — it is a waiting-for-setup
+    state, so the job reports an error result instead of raising. A store
+    load failure or a corrupt stored config fails closed for every org.
     """
     from app import connectors, vectorstore
     from app import google_auth as google_auth_boundary
@@ -115,13 +146,32 @@ async def ingest_drive(
 
     logger.info("job ingest_drive: folder_id=%s org_id=%s user_id=%s", folder_id, org_id, user_id)
 
+    # ALWAYS resolve (even with no stored row): the resolver is the single
+    # gate deciding whether the legacy env/file fallback is authorized.
+    org_cfg, load_failure = await _load_org_connector(org_id, "drive")
+    if load_failure is not None:
+        if load_failure == _LOAD_CONFIG_CORRUPT:
+            # A corrupt stored config must fail closed — never masquerade as
+            # an absent row (which could authorize global credentials).
+            error = f"stored drive connector config for org {org_id} is corrupt or undecryptable; re-save the connector"
+            result = {"error": error, "files_processed": 0, "chunks_stored": 0}
+            await _audit_ingest_summary(org_id, user_id, {"source": "drive", "error": error})
+            return result
+        if not connectors.is_legacy_connector_org(org_id):
+            error = f"no drive connector configured for org {org_id}"
+            result = {"error": error, "files_processed": 0, "chunks_stored": 0}
+            await _audit_ingest_summary(org_id, user_id, {"source": "drive", "error": error})
+            return result
+        # Explicitly bound legacy org: permit the env/file attempt — but only
+        # through the resolver, which re-checks the binding and env presence.
+        org_cfg = None
+
     try:
-        org_cfg = await _load_org_connector(org_id, "drive")
-        resolved_folder, credentials_json, token_json = connectors.resolve_drive_config(org_cfg, folder_id)
+        resolved_folder, credentials_json, token_json = connectors.resolve_drive_config(org_id, org_cfg, folder_id)
     except ValueError as e:
-        # Nothing configured anywhere (or an empty org config): a permanent
-        # waiting-for-setup state, not an ARQ retry.
-        error = str(e) if org_cfg is not None else f"no drive connector configured for org {org_id}"
+        # No authorized credentials anywhere (or an unusable stored config):
+        # a permanent waiting-for-setup state, not an ARQ retry.
+        error = str(e)
         result = {"error": error, "files_processed": 0, "chunks_stored": 0}
         await _audit_ingest_summary(org_id, user_id, {"source": "drive", "error": error})
         return result
@@ -218,37 +268,54 @@ async def ingest_slack(ctx: dict, user_id: str = "", org_id: str = "") -> dict:
 
     Credentials: the org's stored connector (decrypted) — the org's bot token
     is the WebClient credential for this job and the org's channel_ids are
-    the only channels ingested. Without a stored connector the original env
-    path applies. Missing in both places is NOT an ARQ retry — the job
-    reports an error result instead of raising.
+    the only channels ingested. Without a stored connector the env path is
+    available ONLY to the explicitly bound LEGACY_CONNECTOR_ORG_ID (enforced
+    in app.connectors' resolver, checked BEFORE any env inspection). The
+    resolved token/channel_ids are ALWAYS passed downstream explicitly —
+    there is no unguarded None route into low-level env selection. A missing
+    connector is NOT an ARQ retry — the job reports an error result instead
+    of raising. A store load failure or a corrupt stored config fails closed
+    for every org.
     """
     from app import connectors, vectorstore
     from app.slack_ingest import ingest_slack as run_ingest
 
     logger.info("job ingest_slack: org_id=%s user_id=%s", org_id, user_id)
 
-    org_cfg = await _load_org_connector(org_id, "slack")
-
-    token: str | None = None
-    channel_ids: list[str] | None = None
-    if org_cfg is not None:
-        try:
-            token, channel_ids = connectors.resolve_slack_config(org_cfg)
-        except ValueError as e:
-            # Org config present but unusable (e.g. empty token): permanent
-            # waiting-for-setup state, not an ARQ retry.
-            result = {"error": str(e), "channels": 0, "chunks_stored": 0, "chunks_deleted": 0}
-            await _audit_ingest_summary(org_id, user_id, {"source": "slack", "error": str(e)})
+    # ALWAYS resolve (even with no stored row): the resolver is the single
+    # gate deciding whether the legacy env fallback is authorized.
+    org_cfg, load_failure = await _load_org_connector(org_id, "slack")
+    if load_failure is not None:
+        if load_failure == _LOAD_CONFIG_CORRUPT:
+            error = f"stored slack connector config for org {org_id} is corrupt or undecryptable; re-save the connector"
+            result = {"error": error, "channels": 0, "chunks_stored": 0, "chunks_deleted": 0}
+            await _audit_ingest_summary(org_id, user_id, {"source": "slack", "error": error})
             return result
+        if not connectors.is_legacy_connector_org(org_id):
+            error = f"no slack connector configured for org {org_id}"
+            result = {"error": error, "channels": 0, "chunks_stored": 0, "chunks_deleted": 0}
+            await _audit_ingest_summary(org_id, user_id, {"source": "slack", "error": error})
+            return result
+        # Explicitly bound legacy org: permit the env attempt — but only
+        # through the resolver, which re-checks the binding and env presence.
+        org_cfg = None
+
+    try:
+        token, channel_ids = connectors.resolve_slack_config(org_id, org_cfg)
+    except ValueError as e:
+        # No authorized credentials anywhere (or an unusable stored config):
+        # a permanent waiting-for-setup state, not an ARQ retry.
+        result = {"error": str(e), "channels": 0, "chunks_stored": 0, "chunks_deleted": 0}
+        await _audit_ingest_summary(org_id, user_id, {"source": "slack", "error": str(e)})
+        return result
 
     try:
         per_channel = run_ingest(user_id=user_id, org_id=org_id, token=token, channel_ids=channel_ids)
     except ValueError as e:
-        # No org connector AND nothing at the process level: also permanent.
-        # (With an org config this can't happen — resolve validated above.)
-        error = str(e) if token is not None else f"no slack connector configured for org {org_id}"
-        result = {"error": error, "channels": 0, "chunks_stored": 0, "chunks_deleted": 0}
-        await _audit_ingest_summary(org_id, user_id, {"source": "slack", "error": error})
+        # Defensive only — the resolver above already validated token and
+        # channels, so run_ingest's env-selection errors cannot trigger here.
+        result = {"error": str(e), "channels": 0, "chunks_stored": 0, "chunks_deleted": 0}
+        await _audit_ingest_summary(org_id, user_id, {"source": "slack", "error": str(e)})
         return result
 
     counts = {"channels": len(per_channel), "chunks_stored": 0, "chunks_deleted": 0}

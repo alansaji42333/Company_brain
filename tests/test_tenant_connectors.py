@@ -209,16 +209,17 @@ async def _public_views_roundtrip(db, org_id):
     assert len(stored) == 1
     assert "xoxb-live-secret" not in stored[0]
 
-    # Resolution precedence.
+    # Resolution precedence (stored config wins regardless of any binding).
     from app import connectors as c
-    token, ids = c.resolve_slack_config(slack_cfg)
+    token, ids = c.resolve_slack_config(org_id, slack_cfg)
     assert (token, ids) == ("xoxb-live-secret", ["C1"])
     folder, creds, tok = c.resolve_drive_config(
-        await c.get_connector(db, org_id, "drive"), None,
+        org_id, await c.get_connector(db, org_id, "drive"), None,
     )
     assert (folder, creds, tok) == ("folderABC", {"client_secret": "TOPSECRET"}, {"refresh_token": "REFRESHTOKEN"})
 
-    # Delete removes the row; next resolution falls back.
+    # Delete removes the row; resolution then stops (or uses env only for an
+    # explicitly bound legacy org) — see the dedicated legacy-binding tests.
     assert await connectors.delete_connector(db, org_id, "slack") is True
     assert await connectors.delete_connector(db, org_id, "slack") is False
     await db.commit()
@@ -335,13 +336,15 @@ def run_drive_job(org_id: str, folder_id: str | None = None, user_id: str = "sch
 # =====================================================================
 
 def test_slack_worker_uses_org_token_not_env(tenant_db, fake_store, slack_env, monkeypatch):
-    slack_ingest, FakeWebClient = slack_env
+    _, FakeWebClient = slack_env
     database, _ = tenant_db
     collections, _ = fake_store
 
-    # A distinctive env token that must NOT be used.
-    monkeypatch.setattr(slack_ingest, "SLACK_BOT_TOKEN", "xoxb-ENV-SHOULD-NOT-BE-USED")
-    monkeypatch.setattr(slack_ingest, "SLACK_CHANNEL_IDS", "C-ENV-IGNORED")
+    # A distinctive env token that must NOT be used (bound-bind-free env values).
+    from app import connectors as c
+    monkeypatch.setattr(c, "LEGACY_CONNECTOR_ORG_ID", "")  # env can never apply here anyway
+    monkeypatch.setattr(c, "SLACK_BOT_TOKEN", "xoxb-ENV-SHOULD-NOT-BE-USED")
+    monkeypatch.setattr(c, "SLACK_CHANNEL_IDS", "C-ENV-IGNORED")
     FakeWebClient.history["C123"] = [{"ts": "100.000", "user": "U1", "text": "hello org A"}]
 
     async def _seed():
@@ -369,25 +372,53 @@ def test_slack_worker_uses_org_token_not_env(tenant_db, fake_store, slack_env, m
 
 
 # =====================================================================
-# 4. no org config → env fallback (back-compat)
+# 4. explicitly bound legacy org → env fallback (back-compat)
 # =====================================================================
 
-def test_slack_worker_falls_back_to_env_without_org_config(tenant_db, fake_store, slack_env, monkeypatch):
-    slack_ingest, FakeWebClient = slack_env
+def test_slack_worker_legacy_bound_org_uses_env_fallback(tenant_db, fake_store, slack_env, monkeypatch):
+    """Back-compat: an org WITHOUT a stored connector may use the global env
+    credentials ONLY when it is the explicit LEGACY_CONNECTOR_ORG_ID."""
+    from app import connectors as c
+
+    _, FakeWebClient = slack_env
     collections, _ = fake_store
 
-    monkeypatch.setattr(slack_ingest, "SLACK_BOT_TOKEN", "xoxb-ENV-TOKEN")
-    monkeypatch.setattr(slack_ingest, "SLACK_CHANNEL_IDS", "C-env")
+    # Explicitly bind THIS org (restored by monkeypatch after the test).
+    monkeypatch.setattr(c, "LEGACY_CONNECTOR_ORG_ID", "org_legacy")
+    monkeypatch.setattr(c, "SLACK_BOT_TOKEN", "xoxb-ENV-TOKEN")
+    monkeypatch.setattr(c, "SLACK_CHANNEL_IDS", "C-env")
     FakeWebClient.history["C-env"] = [{"ts": "200.000", "user": "U9", "text": "env path works"}]
 
-    result = run_slack_job("org_no_config")  # NO connector row for this org
+    result = run_slack_job("org_legacy")  # no connector row — but explicitly bound
 
-    assert FakeWebClient.constructed == ["xoxb-ENV-TOKEN"], "env token must be used as before"
+    assert FakeWebClient.constructed == ["xoxb-ENV-TOKEN"], "bound org must fall back to env"
     assert result["channels"] == 1
     from app.vectorstore import COLLECTION_NAME
-    metas = collections[COLLECTION_NAME].get(where={"org_id": "org_no_config"})["metadatas"]
+    metas = collections[COLLECTION_NAME].get(where={"org_id": "org_legacy"})["metadatas"]
     assert len(metas) == 1
     assert metas[0]["doc_id"] == "slack_C-env"
+
+
+def test_unbound_org_never_reaches_env_fallback_slack(tenant_db, fake_store, slack_env, monkeypatch):
+    """Security contract: an unconfigured, NON-bound org must never reach the
+    global credentials — even when the env has valid-looking values."""
+    from app import connectors as c
+
+    _, FakeWebClient = slack_env
+    collections, _ = fake_store
+
+    monkeypatch.setattr(c, "LEGACY_CONNECTOR_ORG_ID", "")  # unset binding
+    monkeypatch.setattr(c, "SLACK_BOT_TOKEN", "xoxb-GLOBAL-NOT-FOR-THIS-ORG")
+    monkeypatch.setattr(c, "SLACK_CHANNEL_IDS", "C-global")
+    FakeWebClient.history["C-global"] = [{"ts": "200.000", "user": "U9", "text": "must not appear"}]
+
+    result = run_slack_job("org_unbound")
+
+    assert result["error"] == "no slack connector configured for org org_unbound"
+    assert result["channels"] == 0 and result["chunks_stored"] == 0
+    assert FakeWebClient.constructed == [], "no WebClient may be built for an unbound org"
+    from app.vectorstore import COLLECTION_NAME
+    assert collections[COLLECTION_NAME].count() == 0
 
 
 # =====================================================================
@@ -452,11 +483,14 @@ def test_drive_worker_uses_org_config_and_persists_refresh(tenant_db, fake_store
 # =====================================================================
 
 def test_no_connector_anywhere_returns_clear_error(tenant_db, fake_store, slack_env, monkeypatch):
-    slack_ingest, _Fake = slack_env
+    from app import connectors as c
+
+    _, _Fake = slack_env
     _collections, _ = fake_store  # nothing may be stored; store integrity via empty result
 
-    monkeypatch.setattr(slack_ingest, "SLACK_BOT_TOKEN", "")
-    monkeypatch.setattr(slack_ingest, "SLACK_CHANNEL_IDS", "")
+    monkeypatch.setattr(c, "LEGACY_CONNECTOR_ORG_ID", "")
+    monkeypatch.setattr(c, "SLACK_BOT_TOKEN", "")
+    monkeypatch.setattr(c, "SLACK_CHANNEL_IDS", "")
 
     result = run_slack_job("org_untouched_1")
     assert result["error"] == "no slack connector configured for org org_untouched_1"

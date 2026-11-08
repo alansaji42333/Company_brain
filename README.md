@@ -65,6 +65,7 @@ Optional tunables:
 - `CHUNK_SIZE` — token count per chunk (default: 500)
 - `CHUNK_OVERLAP` — overlap between chunks (default: 50)
 - `TOP_K_RETRIEVAL` — number of chunks to retrieve per query (default: 5)
+- `LEGACY_CONNECTOR_ORG_ID` — exact org id allowed to use the global connector credentials; empty binds nobody (see "Legacy connector binding" under Notes)
 
 ## Usage
 
@@ -181,3 +182,35 @@ Available tools:
 - Re-running ingestion is idempotent — existing chunks are replaced rather than duplicated.
 - Unsupported file types in Drive are logged and skipped.
 - Skill synthesis is incremental — subsequent runs only process newly ingested chunks.
+
+### Legacy connector binding (intentional opt-in compatibility change)
+
+`SLACK_BOT_TOKEN`, `SLACK_CHANNEL_IDS`, `GOOGLE_DRIVE_FOLDER_ID` (and the
+`credentials.json`/`token.json` files) are **global credentials**. Only ONE
+org may ever use them: the org whose exact id is set in
+`LEGACY_CONNECTOR_ORG_ID` in `.env`. Leave it empty and **no org** gets the
+fallback — including permissive-looking empty org ids.
+
+How resolution works for every ingest job (API-triggered or scheduled):
+
+1. If the org has a **stored connector** (admins set it via
+   `PUT /api/v1/orgs/{org_id}/connectors/slack` or `.../connectors/drive`),
+   that org's own encrypted config is used — regardless of the binding.
+2. Otherwise, **only** the bound legacy org falls back to the global
+   env/file credentials above. Every other org's job stops immediately,
+   before authentication, source fetching, embedding, vector storage,
+   replacement, or deletion sweeps, and reports
+   `no <source> connector configured for org <org_id>`.
+
+**Upgrading an existing single-tenant deployment:** you keep running
+exactly as before, but you must explicitly set
+`LEGACY_CONNECTOR_ORG_ID` to the org id that should own the global
+credentials (see the `organizations` table, or the org you log in under),
+then restart **both** the API and the worker processes that consume this
+config (the binding is read at process start). Until that is configured,
+legacy jobs intentionally fail closed with a "no … connector configured"
+error rather than risk ingesting one company's sources under another
+company's org.
+
+A Drive `folder_id` supplied with an ingest request only selects the folder;
+it never grants authority to use the global credentials.

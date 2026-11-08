@@ -321,10 +321,13 @@ def ingest_slack(
     """Ingest Slack channels with REPLACE semantics, per-org capable.
 
     `token`/`channel_ids` are the org's resolved connector values (provided by
-    the worker); when BOTH are None the behavior is byte-for-byte the original
-    env path (SLACK_BOT_TOKEN / SLACK_CHANNEL_IDS). While an org token is in
-    use it is installed as the active per-ingest client context so every fetch
-    helper (and any caller inside the loop) uses that workspace's credentials.
+    the worker, which always resolves them explicitly through the
+    app.connectors resolver gate — the worker never leaves this to env
+    selection). With BOTH None (direct/CLI callers only), the behavior is
+    the original env path (SLACK_BOT_TOKEN / SLACK_CHANNEL_IDS). While an
+    org token is in use it is installed as the active per-ingest client
+    context so every fetch helper (and any caller inside the loop) uses that
+    workspace's credentials.
 
     Returns ``{channel_id: {"chunks": [...], "chunks_deleted": n}}``: for each
     channel the stored chunks of ``slack_{channel_id}`` (this org only) are

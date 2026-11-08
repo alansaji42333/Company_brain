@@ -191,13 +191,34 @@ def test_list_doc_ids_dedupes_per_org_and_source_type(fake_store):
 ORG = "org_tenant1"
 
 
+def _fake_connector_loader(configs_by_org: dict[str, dict[str, dict]]):
+    """Stand-in for worker._load_org_connector at the DB-load boundary.
+
+    Returns explicit, valid fake stored configs per (org, source) so these
+    hermetic freshness tests authorize their own pipelines WITHOUT depending
+    on global-credential fallback (which is bind-gated now).
+    """
+    async def fake_load(org_id, source):
+        cfg = configs_by_org.get(org_id, {}).get(source)
+        return (dict(cfg), None) if cfg is not None else (None, None)
+    return fake_load
+
+
 def run_drive_ingest(monkeypatch, documents, org_id: str = ORG) -> dict:
     """Run the real `ingest_drive` worker job against a scripted folder and
-    the fake vector store."""
+    the fake vector store. The org's connector is supplied as an explicit
+    fake stored config at the loader boundary (no global-credential path)."""
     from app import drive_ingest
+    from app import worker as worker_module
     from app.worker import ingest_drive
 
     monkeypatch.setattr(drive_ingest, "ingest_drive_folder", lambda *a, **kw: list(documents))
+    monkeypatch.setattr(
+        worker_module, "_load_org_connector",
+        _fake_connector_loader({
+            org_id: {"drive": {"folder_id": "folder1", "credentials_json": None, "token_json": None}},
+        }),
+    )
     return asyncio_run_job(ingest_drive, {}, folder_id="folder1", user_id="scheduler", org_id=org_id)
 
 
@@ -215,15 +236,23 @@ def make_slack_chunks(channel_id: str, texts: list[str], org_id: str = ORG) -> l
 
 def run_slack_ingest(monkeypatch, chunks_by_run: list[list[dict]], org_id: str = ORG) -> dict:
     """Run the real `ingest_slack` worker job; each element of
-    `chunks_by_run` is what ingest_slack_channel "returns" on that run."""
+    `chunks_by_run` is what ingest_slack_channel "returns" on that run. The
+    org's connector is supplied as an explicit fake stored config at the
+    loader boundary (no global-credential path)."""
     from app import slack_ingest
+    from app import worker as worker_module
     from app.worker import ingest_slack
 
     runs = iter(chunks_by_run)
-    monkeypatch.setattr(slack_ingest, "SLACK_CHANNEL_IDS", "C123")
     monkeypatch.setattr(
         slack_ingest, "ingest_slack_channel",
         lambda cid, user_id="", org_id="": list(next(runs)),
+    )
+    monkeypatch.setattr(
+        worker_module, "_load_org_connector",
+        _fake_connector_loader({
+            org_id: {"slack": {"bot_token": "xoxb-fake-freshness", "channel_ids": ["C123"]}},
+        }),
     )
 
     return asyncio_run_job(ingest_slack, {}, user_id="scheduler", org_id=org_id)
@@ -421,7 +450,13 @@ def test_slack_failed_channel_keeps_its_stored_chunks(fake_store, monkeypatch):
     fake = collections[vectorstore.COLLECTION_NAME]
 
     runs = iter([make_slack_chunks("C_ok", ["fine"])])
-    monkeypatch.setattr(slack_ingest, "SLACK_CHANNEL_IDS", "C_ok, C_broken")
+    from app import worker as worker_module
+    monkeypatch.setattr(
+        worker_module, "_load_org_connector",
+        _fake_connector_loader({
+            ORG: {"slack": {"bot_token": "xoxb-fake-freshness", "channel_ids": ["C_ok", "C_broken"]}},
+        }),
+    )
     monkeypatch.setattr(slack_ingest, "ingest_slack_channel", lambda cid, user_id="", org_id="": list(next(runs)))
 
     asyncio_run_job(ingest_slack, {}, user_id="scheduler", org_id=ORG)

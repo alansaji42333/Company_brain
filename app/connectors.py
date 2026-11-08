@@ -8,10 +8,13 @@ in memory only while an ingest is running. They are never returned by
 included in audit payloads.
 
 Resolution precedence for ingest:
-  org row → process env fallback → ValueError (nothing configured).
+  org row → explicit legacy binding → ValueError (nothing configured).
 
-An org with no stored row therefore keeps the historical env/file behavior
-of a single-tenant deployment, byte-for-byte.
+The process-level env/file fallback (SLACK_BOT_TOKEN / GOOGLE_DRIVE_FOLDER_ID
+etc.) is available ONLY to the one explicitly bound org (LEGACY_CONNECTOR_ORG_ID,
+empty binds nobody). Every other org without a stored row stops before any
+authentication, source fetching, embedding, storage, or deletion — a missing
+connector can never silently resolve global credentials.
 """
 import base64
 import hashlib
@@ -23,7 +26,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import GOOGLE_DRIVE_FOLDER_ID, SLACK_BOT_TOKEN, SLACK_CHANNEL_IDS
+from app.config import GOOGLE_DRIVE_FOLDER_ID, LEGACY_CONNECTOR_ORG_ID, SLACK_BOT_TOKEN, SLACK_CHANNEL_IDS
 from app.database import OrgConnectorConfig
 
 logger = logging.getLogger(__name__)
@@ -210,47 +213,75 @@ async def delete_connector(db: AsyncSession, org_id: str, source: str) -> bool:
 
 # --- resolution (ingest path) ----------------------------------------------
 
-def resolve_slack_config(org_cfg: dict | None) -> tuple[str, list[str]]:
+def is_legacy_connector_org(org_id: str) -> bool:
+    """True iff `org_id` is the explicit, exact, non-empty legacy binding.
+
+    An unset/blank LEGACY_CONNECTOR_ORG_ID authorizes NO org — including an
+    empty requesting org id. This is the single shared gate for every env/file
+    credential fallback in the system.
+    """
+    return bool(LEGACY_CONNECTOR_ORG_ID) and org_id == LEGACY_CONNECTOR_ORG_ID
+
+
+def resolve_slack_config(org_id: str, org_cfg: dict | None) -> tuple[str, list[str]]:
     """Effective Slack config for an ingest: (bot_token, channel_ids).
 
-    Precedence: org connector config → env (SLACK_BOT_TOKEN / SLACK_CHANNEL_IDS)
-    → ValueError. The org config's channel ids are the ONLY channels ingested.
+    `org_id` is the requesting org and is REQUIRED. Resolution order:
+
+    1. A present stored connector config wins — including an invalid or
+       empty one: that raises rather than dropping onto global credentials.
+    2. Without a stored config, the explicit legacy binding is checked
+       BEFORE any env inspection. Only the bound org may use
+       SLACK_BOT_TOKEN / SLACK_CHANNEL_IDS.
+    3. Otherwise ValueError("no slack connector configured for org …").
     """
-    if org_cfg:
+    if org_cfg is not None:
         token = org_cfg.get("bot_token") or ""
         ids = org_cfg.get("channel_ids") or []
         if token:
             return token, [str(c) for c in ids if str(c).strip()]
-        raise ValueError("Org slack connector config has an empty bot_token")
+        raise ValueError(f"slack connector config for org {org_id} has an empty bot_token")
+
+    if not is_legacy_connector_org(org_id):
+        raise ValueError(f"no slack connector configured for org {org_id}")
 
     token = SLACK_BOT_TOKEN
     ids = [c.strip() for c in SLACK_CHANNEL_IDS.split(",") if c.strip()] if SLACK_CHANNEL_IDS else []
     if not token:
-        raise ValueError("no slack connector configured")
+        raise ValueError(f"no slack connector configured for org {org_id}")
     if not ids:
-        raise ValueError("no slack connector configured (no channels)")
+        raise ValueError(f"no slack connector configured for org {org_id} (no channels)")
     return token, ids
 
 
 def resolve_drive_config(
-    org_cfg: dict | None, folder_id_override: str | None,
+    org_id: str, org_cfg: dict | None, folder_id_override: str | None = None,
 ) -> tuple[str, dict | None, dict | None]:
     """Effective Drive config for an ingest: (folder_id, credentials_json, token_json).
 
-    Precedence for folder_id: folder_id_override → org config → env
-    (GOOGLE_DRIVE_FOLDER_ID). credentials_json/token_json come from the org
-    config or are None, meaning: use the existing credentials.json/token.json
-    file / GOOGLE_* env behavior (single-tenant fallback).
+    `org_id` is the requesting org and is REQUIRED. Resolution order:
 
-    Raises ValueError when nothing resolves (no org config, no override, no env).
+    1. A present stored connector config wins (folder: override > stored);
+       an invalid/empty one raises rather than dropping onto global
+       credentials. Stored configs stay on the headless per-org credentials
+       path (their credential dicts are returned for google_auth).
+    2. Without a stored config, the explicit legacy binding is checked
+       BEFORE any env/file inspection — a supplied `folder_id_override`
+       changes the folder, NOT the authority to use global credentials.
+    3. Otherwise ValueError("no drive connector configured for org …").
+       credentials_json/token_json are None on the legacy path, meaning the
+       existing credentials.json/token.json file / GOOGLE_* env behavior.
     """
-    if org_cfg:
+    if org_cfg is not None:
         folder = folder_id_override or org_cfg.get("folder_id") or ""
         if folder:
             return folder, org_cfg.get("credentials_json"), org_cfg.get("token_json")
-        raise ValueError("Org drive connector config has an empty folder_id")
+        raise ValueError(f"drive connector config for org {org_id} has an empty folder_id")
+
+    if not is_legacy_connector_org(org_id):
+        raise ValueError(f"no drive connector configured for org {org_id}")
 
     folder = folder_id_override or GOOGLE_DRIVE_FOLDER_ID
     if not folder:
-        raise ValueError("no drive connector configured")
+        raise ValueError(f"no drive connector configured for org {org_id}")
     return folder, None, None

@@ -470,7 +470,12 @@ async def delete_org_connector(
     db: AsyncSession = Depends(get_db),
     ctx: AuthContext = Depends(require_admin),
 ):
-    """Delete the org's connector config; ingest falls back to env behavior."""
+    """Delete the org's connector config for `source`.
+
+    After deletion the org is UNCONFIGURED. Its ingest jobs stop before any
+    source/vector work — env/file credentials apply only if the org is still
+    the explicitly bound LEGACY_CONNECTOR_ORG_ID (see app.connectors).
+    """
     _require_member_of(ctx, org_id)
     from app import audit, connectors
     try:
