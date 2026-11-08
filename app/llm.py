@@ -1,6 +1,8 @@
 import logging
+
 from openai import OpenAI
-from app.config import OLLAMA_BASE_URL, OLLAMA_API_KEY, LLM_MODEL, LLM_TIMEOUT
+
+from app.config import LLM_MODEL, LLM_TIMEOUT, OLLAMA_API_KEY, OLLAMA_BASE_URL
 
 logger = logging.getLogger(__name__)
 

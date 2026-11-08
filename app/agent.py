@@ -1,21 +1,25 @@
-import json
-import uuid
-import logging
 import asyncio
+import json
+import logging
 import threading
-from typing import AsyncGenerator
+import uuid
+from collections.abc import AsyncGenerator
+
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import SQLAlchemyError
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from app.config import (
-    LLM_MAX_TOKENS, TOP_K_RETRIEVAL, AGENT_MAX_ITERATIONS,
-)
-from app.llm import chat_completion, chat_completion_stream
-from app.vectorstore import query_both
-from app.tools import TOOL_SCHEMAS, describe_tool_call, execute_tool
-from app.database import Conversation, Message
+from sqlalchemy.ext.asyncio import AsyncSession
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+
 from app import audit
+from app.config import (
+    AGENT_MAX_ITERATIONS,
+    LLM_MAX_TOKENS,
+    TOP_K_RETRIEVAL,
+)
+from app.database import Conversation, Message
+from app.llm import chat_completion, chat_completion_stream
+from app.tools import TOOL_SCHEMAS, describe_tool_call, execute_tool
+from app.vectorstore import query_both
 
 logger = logging.getLogger(__name__)
 

@@ -11,11 +11,17 @@ a JWT `org_id` claim (or X-Org-Id header) is never trusted on its own.
 import logging
 import time
 from dataclasses import dataclass
+
 import httpx
-from jose import jwt, JWTError
+from jose import JWTError, jwt
+
 from app.config import (
-    JWT_SECRET, JWT_ALGORITHM,
-    AUTH0_ENABLED, AUTH0_DOMAIN, AUTH0_AUDIENCE, AUTH0_JWKS_CACHE_TTL,
+    AUTH0_AUDIENCE,
+    AUTH0_DOMAIN,
+    AUTH0_ENABLED,
+    AUTH0_JWKS_CACHE_TTL,
+    JWT_ALGORITHM,
+    JWT_SECRET,
 )
 
 logger = logging.getLogger(__name__)

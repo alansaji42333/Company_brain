@@ -9,6 +9,8 @@ inside the worker process, off the request thread, so HTTP endpoints return
 immediately with a job_id.
 """
 import logging
+from typing import Any, ClassVar
+
 from arq.connections import RedisSettings
 
 from app.config import REDIS_URL
@@ -28,8 +30,8 @@ async def ingest_drive(
     ctx: dict, folder_id: str | None = None, user_id: str = "", org_id: str = "",
 ) -> dict:
     """Ingest a Google Drive folder: extract → chunk → embed → store."""
-    from app.drive_ingest import ingest_drive_folder
     from app.chunking import chunk_documents
+    from app.drive_ingest import ingest_drive_folder
     from app.vectorstore import add_chunks
 
     logger.info("job ingest_drive: folder_id=%s org_id=%s user_id=%s", folder_id, org_id, user_id)
@@ -66,7 +68,7 @@ async def synthesize(ctx: dict, user_id: str = "", org_id: str = "") -> dict:
 
 class WorkerSettings:
     """Configuration consumed by `arq app.worker.WorkerSettings`."""
-    functions = [ingest_drive, ingest_slack, synthesize]
+    functions: ClassVar[list[Any]] = [ingest_drive, ingest_slack, synthesize]
     redis_settings = redis_settings()
     max_jobs = 10
     job_timeout = 600

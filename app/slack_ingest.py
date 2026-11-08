@@ -1,10 +1,12 @@
-import logging
 import hashlib
+import logging
 from datetime import datetime, timezone
+
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
-from app.config import SLACK_BOT_TOKEN, SLACK_CHANNEL_IDS, CHUNK_SIZE, SLACK_CONVERSATION_WINDOW_MINUTES
-from app.chunking import token_count, chunk_document
+
+from app.chunking import chunk_document, token_count
+from app.config import CHUNK_SIZE, SLACK_BOT_TOKEN, SLACK_CHANNEL_IDS, SLACK_CONVERSATION_WINDOW_MINUTES
 
 logger = logging.getLogger(__name__)
 

@@ -8,14 +8,16 @@ Backfills a personal organization per distinct user_id and assigns all of that
 user's existing rows (conversations, audit_logs) to it. Reversible: downgrade
 drops the new tables and columns back to the pre-org schema.
 """
-from typing import Sequence, Union
-from alembic import op
+from collections.abc import Sequence
+
 import sqlalchemy as sa
 
+from alembic import op
+
 revision: str = "0003_organizations"
-down_revision: Union[str, None] = "0002_audit_logs"
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+down_revision: str | None = "0002_audit_logs"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 
 def _personal_slug(user_id: str) -> str:

@@ -1,5 +1,6 @@
 import tiktoken
-from app.config import CHUNK_SIZE, CHUNK_OVERLAP
+
+from app.config import CHUNK_OVERLAP, CHUNK_SIZE
 
 encoder = tiktoken.get_encoding("cl100k_base")
 

@@ -5,9 +5,10 @@ Real: FastAPI routing, JWT auth, SQLAlchemy conversation persistence (sqlite),
       the agent loop + confirmation gating.
 """
 import json
+
 import pytest
-from jose import jwt
 from fastapi.testclient import TestClient
+from jose import jwt
 
 
 def _make_token(secret: str, user_id: str = "user1") -> str:
@@ -17,8 +18,7 @@ def _make_token(secret: str, user_id: str = "user1") -> str:
 @pytest.fixture
 def client(monkeypatch, tmp_path):
     # Ensure a fresh app instance per test with the overridden config.
-    import app.config as config
-    import app.auth as auth
+    from app import auth, config
     monkeypatch.setattr(config, "JWT_SECRET", "test-secret")
     monkeypatch.setattr(auth, "JWT_SECRET", "test-secret")
     monkeypatch.setattr(config, "AUTH0_ENABLED", False)
@@ -26,8 +26,9 @@ def client(monkeypatch, tmp_path):
 
     # Replace the DB engine + session factory with a sqlite in-memory one
     # so tests don't touch Neon.
-    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
-    import app.database as database
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from app import database
 
     test_engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
     test_session = async_sessionmaker(test_engine, expire_on_commit=False)
@@ -102,8 +103,9 @@ def _mock_tool_execute(monkeypatch, result=None):
 def _init_db(monkeypatch):
     """Create sqlite tables for the in-memory config."""
     import asyncio
+
+    from app import database
     from app.database import Base
-    import app.database as database
 
     async def _create():
         async with database.engine.begin() as conn:
@@ -187,8 +189,7 @@ def test_chat_decline_action(client, auth_headers, monkeypatch):
 
 def test_auth0_mode_rejects_shared_secret_token(monkeypatch, auth_headers):
     """When AUTH0 is enabled, shared-secret tokens must be rejected."""
-    import app.config as config
-    import app.auth as auth
+    from app import auth, config
     from app.server import app
 
     monkeypatch.setattr(config, "AUTH0_ENABLED", True)

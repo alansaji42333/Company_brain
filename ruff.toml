@@ -1,1 +1,13 @@
 line-length = 140
+
+[lint.flake8-bugbear]
+# FastAPI's dependency-injection pattern places Depends()/Header() calls in
+# argument defaults; they are evaluated at import time and are effectively
+# immutable, so teach B008 to accept them.
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Header"]
+
+[lint]
+# BLE001: the codebase deliberately uses broad `except Exception` blocks that
+# log (logger.exception) and continue at request/ingest/LLM boundaries — a
+# failed integration must not take down the calling path.
+ignore = ["BLE001"]

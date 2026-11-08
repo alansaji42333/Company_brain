@@ -22,9 +22,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-from app.config import COLLECTION_NAME, COLLECTION_SKILLS  # noqa: E402
-from app.orgs import personal_org_id  # noqa: E402
-from app.vectorstore import _get_collection  # noqa: E402
+from app.config import COLLECTION_NAME, COLLECTION_SKILLS
+from app.orgs import personal_org_id
+from app.vectorstore import _get_collection
 
 
 def retag(collection_name: str, apply: bool) -> dict:

@@ -23,8 +23,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-from app.config import SKILLS_DIR  # noqa: E402
-from app.orgs import personal_org_id  # noqa: E402
+from app.config import SKILLS_DIR
+from app.orgs import personal_org_id
 
 
 def migrate(apply: bool) -> None:

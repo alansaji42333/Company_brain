@@ -1,9 +1,11 @@
 import logging
+from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
-from typing import AsyncGenerator
-from sqlalchemy import Column, String, DateTime, JSON, ForeignKey, Integer, UniqueConstraint
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+
+from sqlalchemy import JSON, Column, DateTime, ForeignKey, Integer, String, UniqueConstraint
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, relationship
+
 from app.config import DATABASE_URL
 
 logger = logging.getLogger(__name__)

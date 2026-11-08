@@ -1,9 +1,13 @@
+import logging
 import os
+
 from dotenv import load_dotenv
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 
 def _rate_limit_key(request) -> str:
@@ -19,7 +23,7 @@ def _rate_limit_key(request) -> str:
             if sub:
                 return f"user:{sub}"
         except Exception:
-            pass
+            logger.debug("Could not read rate-limit identity from token; falling back to client address")
     return get_remote_address(request)
 
 

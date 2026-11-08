@@ -1,23 +1,28 @@
-import os
 import logging
-import structlog
+import os
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Depends, Header, Request, WebSocket, WebSocketDisconnect
+
+import structlog
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import text
 from slowapi.errors import RateLimitExceeded
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database import get_db
-from app.config import (
-    CORS_ORIGINS, RATE_LIMIT, limiter,
-    validate_config, SCHEDULE_ENABLED,
-)
+from app.api_v1 import ingest_router
+from app.api_v1 import router as v1_router
 from app.auth import AuthContext, AuthError
+from app.config import (
+    CORS_ORIGINS,
+    RATE_LIMIT,
+    SCHEDULE_ENABLED,
+    limiter,
+    validate_config,
+)
+from app.database import get_db
 from app.orgs import REVIEW_ROLES
-from app.api_v1 import router as v1_router, ingest_router
 
 structlog.configure(
     processors=[
@@ -100,6 +105,7 @@ async def lifespan(app: FastAPI):
     # work; only the async /ingest/* and /ingest/status routes require Redis.
     try:
         from arq import create_pool
+
         from app.worker import redis_settings
         app.state.redis = await create_pool(redis_settings())
         logger.info("arq redis pool connected")
@@ -148,8 +154,10 @@ def skills_page():
 # Kept so existing clients / vanilla JS UIs keep working during the
 # migration to the versioned /api/v1 endpoints.
 
-from app.api_v1 import (  # noqa: E402
-    ChatRequest, ConfirmRequest, UpdateSkillRequest,
+from app.api_v1 import (
+    ChatRequest,
+    ConfirmRequest,
+    UpdateSkillRequest,
 )
 
 
@@ -377,17 +385,17 @@ async def ws_chat(ws: WebSocket):
                 await ws.send_json({"type": "error", "detail": f"Unknown action: {action!r}"})
     except WebSocketDisconnect:
         return
-    except Exception as e:
-        logger.exception("WebSocket error: %s", e)
+    except Exception:
+        logger.exception("WebSocket error")
         try:
             await ws.send_json({"type": "error", "detail": "Internal error"})
         except Exception:
-            pass
+            logger.debug("Could not deliver error frame to closed websocket")
 
 
 async def _ws_run_stream(ws: WebSocket, ctx: AuthContext, kind: str, **kwargs):
     """Drive a streaming agent generator and forward every event to the WS."""
-    from app.agent import send_message_stream, confirm_action_stream
+    from app.agent import confirm_action_stream, send_message_stream
     from app.database import async_session
 
     async with async_session() as db:

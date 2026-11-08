@@ -7,7 +7,9 @@ action (the audit row is appended within the caller's existing transaction
 where possible, so a DB failure rolls the whole request back).
 """
 import logging
+
 from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.database import AuditLog
 
 logger = logging.getLogger(__name__)

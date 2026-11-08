@@ -1,14 +1,16 @@
-import os
 import json
 import logging
+import os
 from datetime import datetime, timezone
+
 from app.config import (
+    LAST_SYNTHESIS_FILE,
     LLM_MAX_TOKENS_SYNTHESIS,
-    SYNTHESIS_CHUNKS_PER_BATCH, LAST_SYNTHESIS_FILE,
+    SYNTHESIS_CHUNKS_PER_BATCH,
 )
 from app.llm import chat_completion
-from app.vectorstore import _get_collection, COLLECTION_NAME
 from app.skill_store import create_skill, list_skills
+from app.vectorstore import COLLECTION_NAME, _get_collection
 
 logger = logging.getLogger(__name__)
 

@@ -8,7 +8,7 @@ only a hint — if no membership exists the request is rejected with 403.
 from fastapi import Depends, Header, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import AuthContext, verify_token_payload, AuthError
+from app.auth import AuthContext, AuthError, verify_token_payload
 from app.database import get_db
 from app.orgs import resolve_auth_context
 

@@ -1,8 +1,10 @@
 import logging
 from datetime import datetime, timezone
 from typing import Any
+
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+
 from app.google_auth import get_credentials
 
 logger = logging.getLogger(__name__)
@@ -78,8 +80,9 @@ def extract_text(file_info: dict, service) -> Document | None:
         raw = download_file(service, file_id)
         if raw is None:
             return None
-        from pypdf import PdfReader
         import io
+
+        from pypdf import PdfReader
         reader = PdfReader(io.BytesIO(raw))
         text = "\n".join(page.extract_text() or "" for page in reader.pages)
     elif file_type in ("txt", "md"):

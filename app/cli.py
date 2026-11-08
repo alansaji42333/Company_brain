@@ -13,8 +13,8 @@ def _org_id(args) -> str:
 
 
 def cmd_ingest(args):
-    from app.drive_ingest import ingest_drive_folder
     from app.chunking import chunk_documents
+    from app.drive_ingest import ingest_drive_folder
     from app.vectorstore import add_chunks
 
     user_id = args.user_id or "cli"

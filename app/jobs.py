@@ -10,6 +10,7 @@ recorded in Redis under `job:{job_id}` so the status endpoint can only be
 polled by the org that enqueued the job.
 """
 import logging
+
 from arq import ArqRedis
 from arq.jobs import Job, JobStatus
 

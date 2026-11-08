@@ -18,8 +18,8 @@ from jose import jwt
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.config import JWT_SECRET, JWT_ALGORITHM  # noqa: E402
-from app.orgs import personal_org_id  # noqa: E402
+from app.config import JWT_ALGORITHM, JWT_SECRET
+from app.orgs import personal_org_id
 
 
 def main():

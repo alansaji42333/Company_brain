@@ -1,10 +1,12 @@
 import logging
 from datetime import datetime
+
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
-from app.config import SLACK_BOT_TOKEN, SLACK_CHANNEL_IDS, GOOGLE_SHEET_ID, GOOGLE_SHEET_TAB
+
+from app.config import GOOGLE_SHEET_ID, GOOGLE_SHEET_TAB, SLACK_BOT_TOKEN, SLACK_CHANNEL_IDS
 from app.google_auth import get_credentials
 
 logger = logging.getLogger(__name__)
@@ -132,7 +134,7 @@ def _execute_slack_message(tool_input: dict) -> dict:
     channel_id = tool_input.get("channel_id", "")
     message = tool_input.get("message", "")
 
-    allowed = set(c.strip() for c in SLACK_CHANNEL_IDS.split(",") if c.strip())
+    allowed = {c.strip() for c in SLACK_CHANNEL_IDS.split(",") if c.strip()}
     if channel_id not in allowed:
         allowed_str = ", ".join(allowed) if allowed else "none"
         return {
