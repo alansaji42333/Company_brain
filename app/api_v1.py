@@ -5,23 +5,34 @@ caller's (user_id, org_id, role) by verifying a real membership, and every
 query filters on that org_id. Role gates are applied with `require_role`.
 """
 import logging
-from fastapi import APIRouter, HTTPException, Depends, Request
+
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database import get_db
-from app.config import RATE_LIMIT, limiter
 from app.auth import AuthContext
+from app.config import RATE_LIMIT, limiter
+from app.database import get_db
 from app.deps import get_auth_context, require_role
 from app.orgs import (
-    ROLE_ADMIN, REVIEW_ROLES, get_organization, create_org, list_members,
-    add_member, set_member_role, remove_member,
+    REVIEW_ROLES,
+    ROLE_ADMIN,
+    add_member,
+    create_org,
+    get_organization,
+    list_members,
+    remove_member,
+    set_member_role,
 )
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1", tags=["v1"])
 ingest_router = APIRouter(prefix="/api/ingest", tags=["ingest"])
+
+# Pre-built role-gate dependencies (avoids function calls in argument defaults).
+require_reviewer = require_role(*REVIEW_ROLES)
+require_admin = require_role(ROLE_ADMIN)
 
 
 # --- models ---------------------------------------------------------------
@@ -102,7 +113,7 @@ class IngestStatusResponse(BaseModel):
 @limiter.limit(RATE_LIMIT)
 def synthesize(
     request: Request,
-    ctx: AuthContext = Depends(require_role(*REVIEW_ROLES)),
+    ctx: AuthContext = Depends(require_reviewer),
 ):
     from app.skill_synthesis import synthesize as run_synthesis
     summary = run_synthesis(org_id=ctx.org_id)
@@ -113,7 +124,7 @@ def synthesize(
 @limiter.limit(RATE_LIMIT)
 async def synthesize_async(
     request: Request,
-    ctx: AuthContext = Depends(require_role(*REVIEW_ROLES)),
+    ctx: AuthContext = Depends(require_reviewer),
 ):
     from app.jobs import enqueue_synthesis
     pool = _require_redis(request)
@@ -142,7 +153,7 @@ def get_skill(skill_id: str, ctx: AuthContext = Depends(get_auth_context)):
 def update_skill(
     skill_id: str,
     req: UpdateSkillRequest,
-    ctx: AuthContext = Depends(require_role(*REVIEW_ROLES)),
+    ctx: AuthContext = Depends(require_reviewer),
 ):
     from app.skill_store import save_skill
     save_skill(org_id=ctx.org_id, skill_id=skill_id, body_content=req.content)
@@ -152,11 +163,11 @@ def update_skill(
 @router.post("/skills/{skill_id}/approve")
 async def approve_skill(
     skill_id: str,
-    ctx: AuthContext = Depends(require_role(*REVIEW_ROLES)),
+    ctx: AuthContext = Depends(require_reviewer),
     db: AsyncSession = Depends(get_db),
 ):
-    from app.skill_store import approve_skill as approve
     from app import audit
+    from app.skill_store import approve_skill as approve
     try:
         approve(org_id=ctx.org_id, skill_id=skill_id)
     except ValueError as e:
@@ -169,11 +180,11 @@ async def approve_skill(
 @router.post("/skills/{skill_id}/reject")
 async def reject_skill(
     skill_id: str,
-    ctx: AuthContext = Depends(require_role(*REVIEW_ROLES)),
+    ctx: AuthContext = Depends(require_reviewer),
     db: AsyncSession = Depends(get_db),
 ):
-    from app.skill_store import reject_skill as reject
     from app import audit
+    from app.skill_store import reject_skill as reject
     try:
         reject(org_id=ctx.org_id, skill_id=skill_id)
     except ValueError as e:
@@ -220,6 +231,7 @@ async def list_conversations(
 ):
     """List the caller's own conversations within their org."""
     from sqlalchemy import select
+
     from app.database import Conversation
     result = await db.execute(
         select(Conversation).where(
@@ -238,7 +250,7 @@ async def list_conversations(
 
 @router.get("/audit")
 async def list_audit(
-    ctx: AuthContext = Depends(require_role(ROLE_ADMIN)),
+    ctx: AuthContext = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
     limit: int = 100,
 ):
@@ -312,7 +324,7 @@ async def add_org_member(
     org_id: str,
     req: AddMemberRequest,
     db: AsyncSession = Depends(get_db),
-    ctx: AuthContext = Depends(require_role(ROLE_ADMIN)),
+    ctx: AuthContext = Depends(require_admin),
 ):
     """Add or update a member's role (admins of that org only)."""
     _require_member_of(ctx, org_id)
@@ -339,14 +351,14 @@ async def update_org_member(
     req: UpdateMemberRequest,
     user_id: str,
     db: AsyncSession = Depends(get_db),
-    ctx: AuthContext = Depends(require_role(ROLE_ADMIN)),
+    ctx: AuthContext = Depends(require_admin),
 ):
     """Change a member's role. The last admin cannot be demoted."""
     _require_member_of(ctx, org_id)
     if req.role not in (ROLE_ADMIN, "reviewer", "member"):
         raise HTTPException(status_code=400, detail="Invalid role")
     try:
-        member = await set_member_role(db, org_id, user_id, req.role)
+        member = await set_member_role(db, org_id, user_id, req.role, actor_user_id=ctx.user_id)
     except ValueError as e:
         detail = str(e)
         status = 404 if "not found" in detail else 409
@@ -360,12 +372,12 @@ async def delete_org_member(
     org_id: str,
     user_id: str,
     db: AsyncSession = Depends(get_db),
-    ctx: AuthContext = Depends(require_role(ROLE_ADMIN)),
+    ctx: AuthContext = Depends(require_admin),
 ):
     """Remove a member from an org. The last admin cannot be removed."""
     _require_member_of(ctx, org_id)
     try:
-        await remove_member(db, org_id, user_id)
+        await remove_member(db, org_id, user_id, actor_user_id=ctx.user_id)
     except ValueError as e:
         detail = str(e)
         status = 404 if "not found" in detail else 409
@@ -398,7 +410,7 @@ def _require_redis(request: Request):
 @limiter.limit(RATE_LIMIT)
 async def ingest_drive_async(
     request: Request,
-    ctx: AuthContext = Depends(require_role(*REVIEW_ROLES)),
+    ctx: AuthContext = Depends(require_reviewer),
     folder_id: str | None = None,
 ):
     from app.jobs import enqueue_ingest_drive
@@ -411,7 +423,7 @@ async def ingest_drive_async(
 @limiter.limit(RATE_LIMIT)
 async def ingest_slack_async(
     request: Request,
-    ctx: AuthContext = Depends(require_role(*REVIEW_ROLES)),
+    ctx: AuthContext = Depends(require_reviewer),
 ):
     from app.jobs import enqueue_ingest_slack
     pool = _require_redis(request)

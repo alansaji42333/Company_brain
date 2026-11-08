@@ -14,11 +14,12 @@ import logging
 import re
 import uuid
 
-from sqlalchemy import select, func, delete as sa_delete
+from sqlalchemy import delete as sa_delete
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import AuthContext, AuthError
-from app.database import Organization, Membership
+from app.database import Membership, Organization
 
 logger = logging.getLogger(__name__)
 
@@ -162,31 +163,39 @@ async def count_admins(db: AsyncSession, org_id: str) -> int:
 
 async def add_member(
     db: AsyncSession, org_id: str, user_id: str, role: str = ROLE_MEMBER
-) -> None:
+) -> Membership:
     if role not in ROLES:
         raise ValueError(f"Invalid role: {role}")
     existing = await get_membership(db, org_id, user_id)
     if existing is not None:
         raise ValueError("User is already a member of this organization")
-    db.add(Membership(org_id=org_id, user_id=user_id, role=role))
+    membership = Membership(org_id=org_id, user_id=user_id, role=role)
+    db.add(membership)
     await db.flush()
+    return membership
 
 
 async def set_member_role(
     db: AsyncSession, org_id: str, user_id: str, role: str, actor_user_id: str
-) -> None:
-    """Set a member's role; protects against demoting/removing the last admin."""
+) -> Membership:
+    """Set a member's role; protects against demoting/removing the last admin.
+
+    The guard applies regardless of who the actor is — a sole admin cannot
+    demote themselves either, because an org must never be left without an
+    admin.
+    """
     if role not in ROLES:
         raise ValueError(f"Invalid role: {role}")
     membership = await get_membership(db, org_id, user_id)
     if membership is None:
         raise ValueError("User is not a member of this organization")
 
-    if membership.role == ROLE_ADMIN and role != ROLE_ADMIN and user_id != actor_user_id:
-        if await count_admins(db, org_id) <= 1:
-            raise ValueError("Cannot demote the last admin of the organization")
+    if membership.role == ROLE_ADMIN and role != ROLE_ADMIN and await count_admins(db, org_id) <= 1:
+        raise ValueError("Cannot demote the last admin of the organization")
     membership.role = role
     await db.flush()
+    await db.refresh(membership)
+    return membership
 
 
 async def remove_member(
@@ -196,9 +205,10 @@ async def remove_member(
     if membership is None:
         raise ValueError("User is not a member of this organization")
 
-    if membership.role == ROLE_ADMIN and user_id != actor_user_id:
-        if await count_admins(db, org_id) <= 1:
-            raise ValueError("Cannot remove the last admin of the organization")
+    # The last admin cannot be removed — including self-removal (an org must
+    # always keep at least one admin).
+    if membership.role == ROLE_ADMIN and await count_admins(db, org_id) <= 1:
+        raise ValueError("Cannot remove the last admin of the organization")
 
     await db.execute(
         sa_delete(Membership).where(
