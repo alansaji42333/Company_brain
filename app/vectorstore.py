@@ -126,6 +126,49 @@ def update_metadata(ids: list[str], metadatas: list[dict], collection: str = COL
     logger.info("Updated metadata for %d id(s) in %s", len(ids), collection)
 
 
+def delete_by_doc_id(doc_id: str, org_id: str, collection: str = COLLECTION_NAME) -> int:
+    """Delete ALL stored chunks of one logical document in one org.
+
+    The number of chunks a document has is unknown by design (chunking is
+    content-dependent), so this matches the stored metadata via a Chroma
+    `where` filter rather than enumerating chunk indexes. Returns the number
+    of chunks deleted.
+    """
+    col = _get_collection(collection)
+    result = col.get(where={"doc_id": doc_id, "org_id": org_id})
+    ids = list(result.get("ids") or [])
+    if ids:
+        col.delete(ids=ids)
+        logger.info("Deleted %d chunk(s) of doc %s (org %s) from %s", len(ids), doc_id, org_id, collection)
+    return len(ids)
+
+
+def get_doc_chunk_metadatas(doc_id: str, org_id: str, collection: str = COLLECTION_NAME) -> list[dict]:
+    """Stored metadatas for all chunks of one logical document in one org.
+
+    Used for change detection: callers compare metadata (e.g. content_hash)
+    against the freshly extracted document before re-embedding.
+    """
+    col = _get_collection(collection)
+    result = col.get(where={"doc_id": doc_id, "org_id": org_id}, include=["metadatas"])
+    return list(result.get("metadatas") or [])
+
+
+def list_doc_ids(org_id: str, source_type: str, collection: str = COLLECTION_NAME) -> set[str]:
+    """Distinct doc_ids stored for one org and source_type.
+
+    Used for the source-freshness deletion sweep ("what is stored but no
+    longer exists in the source"). Prototype scale: this fetches every chunk
+    metadata for the org and dedupes in Python — fine up to tens of thousands
+    of chunks; move dedupe server-side (aggregate query / doc registry table)
+    if orgs outgrow that.
+    """
+    col = _get_collection(collection)
+    result = col.get(where={"org_id": org_id, "source_type": source_type}, include=["metadatas"])
+    metadatas = result.get("metadatas") or []
+    return {m.get("doc_id") for m in metadatas if m and m.get("doc_id")}
+
+
 def delete_by_ids(ids: list[str], collection: str = COLLECTION_NAME):
     col = _get_collection(collection)
     existing = col.get(ids=ids)
