@@ -87,7 +87,7 @@ def _mock_llm(monkeypatch, responses):
 
 def _mock_retrieval(monkeypatch, sources=None):
     """Mock ChromaDB retrieval to return scripted sources (or none)."""
-    def fake_query_both(question, top_k=None, user_id=None):
+    def fake_query_both(question, top_k=None, user_id=None, org_id=None, **kwargs):
         return {"raw": [], "skills": []}
 
     monkeypatch.setattr("app.agent.query_both", fake_query_both)

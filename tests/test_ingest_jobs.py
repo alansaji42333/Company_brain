@@ -68,6 +68,17 @@ def client(monkeypatch, tmp_path):
     pool = _FakePool()
     from app.server import app
     app.state.redis = pool
+
+    # Create schema for in-memory DB (memberships/orgs required by auth context)
+    from app.database import Base
+    import asyncio
+    import app.database as database
+
+    async def _create():
+        async with database.engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+    asyncio.run(_create())
     return TestClient(app), pool
 
 
@@ -116,7 +127,7 @@ def test_ingest_status_returns_result_when_complete(client, auth_headers, monkey
 
     expected = {"job_id": job_id, "status": "complete", "result": {"chunks_stored": 42}}
 
-    async def fake_status(pool_arg, jid, user_id):
+    async def fake_status(pool_arg, jid, user_id, org_id=None, **kwargs):
         assert jid == job_id
         assert user_id == "user1"
         return expected
