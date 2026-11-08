@@ -11,7 +11,7 @@ from slowapi.errors import RateLimitExceeded
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api_v1 import ingest_router
+from app.api_v1 import ChatRequest, ConfirmRequest, UpdateSkillRequest, ingest_router
 from app.api_v1 import router as v1_router
 from app.auth import AuthContext, AuthError
 from app.config import (
@@ -153,13 +153,6 @@ def skills_page():
 # --- backwards-compatible root API routes (proxy to v1) ------------------
 # Kept so existing clients / vanilla JS UIs keep working during the
 # migration to the versioned /api/v1 endpoints.
-
-from app.api_v1 import (
-    ChatRequest,
-    ConfirmRequest,
-    UpdateSkillRequest,
-)
-
 
 @app.post("/synthesize")
 @limiter.limit(RATE_LIMIT)
