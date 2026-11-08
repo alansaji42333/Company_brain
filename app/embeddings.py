@@ -1,5 +1,5 @@
 import logging
-from chromadb.utils import embedding_functions
+from chromadb.utils.embedding_functions.onnx_mini_lm_l6_v2 import ONNXMiniLM_L6_V2
 
 logger = logging.getLogger(__name__)
 
@@ -10,7 +10,7 @@ def _get_ef():
     global _ef
     if _ef is None:
         logger.info("Initializing ONNX embedding model: all-MiniLM-L6-v2")
-        _ef = embedding_functions.DefaultEmbeddingFunction()
+        _ef = ONNXMiniLM_L6_V2()
     return _ef
 
 
