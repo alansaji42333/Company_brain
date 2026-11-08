@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-import os
 import logging
+import os
+
 import chromadb
 from chromadb.config import Settings
+
 from app.config import CHROMA_DIR, COLLECTION_NAME, COLLECTION_SKILLS, TOP_K_RETRIEVAL, TOP_K_SKILLS
 from app.embeddings import embed
 
@@ -28,12 +30,22 @@ def _get_collection(name: str = COLLECTION_NAME) -> chromadb.Collection:
     return _collections[name]
 
 
+def stored_chunk_id(org_id: str, doc_id: str, chunk_index: int) -> str:
+    """The stored Chroma id for a chunk in `org_id` with this doc/index.
+
+    This is the SINGLE derivation of stored vector ids — add_chunks uses it
+    (via _chunk_id), and any code deleting/appending vectors for a specific
+    chunk must build its id here rather than string-formatting it locally.
+    """
+    return f"{org_id}_{doc_id}_{chunk_index}"
+
+
 def _chunk_id(c: dict) -> str:
     org_id = c.get("org_id", "") or ""
     if org_id:
-        return f"{org_id}_{c['doc_id']}_{c['chunk_index']}"
+        return stored_chunk_id(org_id, c["doc_id"], c["chunk_index"])
     user_id = c.get("user_id", "")
-    return f"{user_id}_{c['doc_id']}_{c['chunk_index']}"
+    return stored_chunk_id(user_id, c["doc_id"], c["chunk_index"])
 
 
 def add_chunks(chunks: list[dict], collection: str = COLLECTION_NAME):

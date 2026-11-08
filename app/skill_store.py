@@ -1,12 +1,13 @@
+import logging
 import os
 import re
-import logging
 from datetime import datetime, timezone
 from typing import Any
+
 import frontmatter
+
 from app.config import SKILLS_DIR
-from app.vectorstore import add_chunks, delete_by_ids
-from app.vectorstore import COLLECTION_SKILLS
+from app.vectorstore import COLLECTION_SKILLS, add_chunks, delete_by_ids, stored_chunk_id
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +97,21 @@ def get_skill(org_id: str, skill_id: str, only_approved: bool = False) -> dict[s
     }
 
 
+def _skill_doc_id(org_id: str, skill_id: str) -> str:
+    """The doc_id under which an org's approved skill is embedded."""
+    return f"skill_{org_id}_{skill_id}"
+
+
+def _skill_stored_id(org_id: str, skill_id: str) -> str:
+    """The stored Chroma id of an org skill's embedded vector (chunk 0).
+
+    Single derivation: add_chunks (via vectorstore._chunk_id → stored_chunk_id)
+    computes the id for a chunk with doc_id=_skill_doc_id and chunk_index=0
+    exactly this way. Approve embeds and reject/edits delete this SAME id.
+    """
+    return stored_chunk_id(org_id, _skill_doc_id(org_id, skill_id), 0)
+
+
 def save_skill(org_id: str, skill_id: str, body_content: str):
     path = os.path.join(_org_dir(org_id), f"{skill_id}.md")
     now = _now_iso()
@@ -160,7 +176,7 @@ def approve_skill(org_id: str, skill_id: str):
 
     full_text = f"# {post['title']}\n\n{post.content}"
     chunk = {
-        "doc_id": f"skill_{org_id}_{skill_id}",
+        "doc_id": _skill_doc_id(org_id, skill_id),
         "doc_name": post["title"],
         "source_url": "",
         "chunk_index": 0,
@@ -171,7 +187,7 @@ def approve_skill(org_id: str, skill_id: str):
         "org_id": org_id,
     }
     add_chunks([chunk], collection=COLLECTION_SKILLS)
-    logger.info("Approved and embedded skill doc: %s", skill_id)
+    logger.info("Approved and embedded skill doc: %s (stored id %s)", skill_id, _skill_stored_id(org_id, skill_id))
 
 
 def reject_skill(org_id: str, skill_id: str):
@@ -187,6 +203,5 @@ def reject_skill(org_id: str, skill_id: str):
     with open(path, "w") as f:
         f.write(frontmatter.dumps(post))
 
-    doc_id = f"{org_id}_skill_{skill_id}_0"
-    delete_by_ids([doc_id], collection=COLLECTION_SKILLS)
+    delete_by_ids([_skill_stored_id(org_id, skill_id)], collection=COLLECTION_SKILLS)
     logger.info("Rejected and removed skill doc from retrieval: %s", skill_id)
