@@ -4,9 +4,10 @@ Mocks the LLM streaming API; verifies the WS protocol: payload auth, token
 streaming, tool_proposal safety gate, and tool_confirm continuation.
 """
 import json
+
 import pytest
-from jose import jwt
 from fastapi.testclient import TestClient
+from jose import jwt
 
 
 def _make_token(secret: str, user_id: str = "user1") -> str:
@@ -72,7 +73,11 @@ def _mock_stream(monkeypatch, chunk_lists):
 
 
 def _mock_retrieval(monkeypatch):
-    monkeypatch.setattr("app.agent.query_both", lambda question, top_k=None, user_id=None: {"raw": [], "skills": []})
+    # query_both is org-scoped: query_both(question, top_k=None, org_id=None, user_id=None)
+    def fake_query_both(question, top_k=None, org_id=None, user_id=None, **kwargs):
+        return {"raw": [], "skills": []}
+
+    monkeypatch.setattr("app.agent.query_both", fake_query_both)
 
 
 def _mock_tool_execute(monkeypatch, result=None):
@@ -81,10 +86,27 @@ def _mock_tool_execute(monkeypatch, result=None):
     monkeypatch.setattr("app.tools.execute_tool", lambda name, inp: result)
 
 
+def _receive_until(ws, stop_types):
+    """Receive events until one of `stop_types` arrives; fail fast on errors.
+
+    Without this, a server-side error event would leave the test blocking on
+    receive_json forever (a hang instead of a failure).
+    """
+    events = []
+    while True:
+        evt = ws.receive_json()
+        events.append(evt)
+        if evt.get("type") == "error":
+            raise AssertionError(f"Unexpected WS error event: {evt}")
+        if evt.get("type") in stop_types:
+            return events
+
+
 def _init_db(monkeypatch):
     import asyncio
+
+    from app import database
     from app.database import Base
-    import app.database as database
 
     async def _create():
         async with database.engine.begin() as conn:
@@ -95,15 +117,15 @@ def _init_db(monkeypatch):
 
 @pytest.fixture
 def app_client(monkeypatch, tmp_path):
-    import app.config as config
-    import app.auth as auth
+    from app import auth, config
     monkeypatch.setattr(config, "JWT_SECRET", "test-secret")
     monkeypatch.setattr(auth, "JWT_SECRET", "test-secret")
     monkeypatch.setattr(config, "AUTH0_ENABLED", False)
     monkeypatch.setattr(auth, "AUTH0_ENABLED", False)
 
-    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
-    import app.database as database
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from app import database
     test_engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
     test_session = async_sessionmaker(test_engine, expire_on_commit=False)
     monkeypatch.setattr(database, "engine", test_engine)
@@ -154,11 +176,7 @@ def test_ws_streams_tokens_and_message(app_client, monkeypatch):
         ws.send_json({"action": "auth", "token": token})
         ws.send_json({"action": "chat", "message": "hi"})
 
-        events = []
-        while len(events) < 5:
-            events.append(ws.receive_json())
-            if events[-1].get("type") == "message":
-                break
+        events = _receive_until(ws, {"message"})
 
         types = [e["type"] for e in events]
         assert types[0] == "sources"
@@ -181,12 +199,7 @@ def test_ws_tool_proposal_safety_gate(app_client, monkeypatch):
         ws.send_json({"action": "auth", "token": token})
         ws.send_json({"action": "chat", "message": "send a message"})
 
-        events = []
-        while True:
-            evt = ws.receive_json()
-            events.append(evt)
-            if evt["type"] == "tool_proposal":
-                break
+        events = _receive_until(ws, {"tool_proposal"})
 
         types = [e["type"] for e in events]
         assert types[0] == "sources"
@@ -215,12 +228,8 @@ def test_ws_tool_confirm_continues_stream(app_client, monkeypatch):
         ws.send_json({"action": "chat", "message": "send a message"})
 
         # Read up to the tool_proposal.
-        prop = None
-        while True:
-            evt = ws.receive_json()
-            if evt["type"] == "tool_proposal":
-                prop = evt
-                break
+        events = _receive_until(ws, {"tool_proposal"})
+        prop = events[-1]
 
         # Confirm the proposed tool.
         ws.send_json({
@@ -231,12 +240,7 @@ def test_ws_tool_confirm_continues_stream(app_client, monkeypatch):
         })
 
         # Expect tool_result then tokens then final message.
-        events = []
-        while True:
-            evt = ws.receive_json()
-            events.append(evt)
-            if evt["type"] == "message":
-                break
+        events = _receive_until(ws, {"message"})
 
         types = [e["type"] for e in events]
         assert "tool_result" in types

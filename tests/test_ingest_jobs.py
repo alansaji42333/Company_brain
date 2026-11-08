@@ -5,8 +5,8 @@ and slack endpoints enqueue the right function and return a job_id, and that
 the status endpoint returns job state and enforces per-user ownership.
 """
 import pytest
-from jose import jwt
 from fastapi.testclient import TestClient
+from jose import jwt
 
 
 def _make_token(secret: str, user_id: str = "user1") -> str:
@@ -51,15 +51,15 @@ class _FakePool:
 
 @pytest.fixture
 def client(monkeypatch, tmp_path):
-    import app.config as config
-    import app.auth as auth
+    from app import auth, config
     monkeypatch.setattr(config, "JWT_SECRET", "test-secret")
     monkeypatch.setattr(auth, "JWT_SECRET", "test-secret")
     monkeypatch.setattr(config, "AUTH0_ENABLED", False)
     monkeypatch.setattr(auth, "AUTH0_ENABLED", False)
 
-    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
-    import app.database as database
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from app import database
     test_engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
     test_session = async_sessionmaker(test_engine, expire_on_commit=False)
     monkeypatch.setattr(database, "engine", test_engine)
@@ -70,9 +70,10 @@ def client(monkeypatch, tmp_path):
     app.state.redis = pool
 
     # Create schema for in-memory DB (memberships/orgs required by auth context)
-    from app.database import Base
     import asyncio
-    import app.database as database
+
+    from app import database
+    from app.database import Base
 
     async def _create():
         async with database.engine.begin() as conn:
@@ -121,7 +122,7 @@ def test_ingest_slack_enqueues(client, auth_headers):
 
 
 def test_ingest_status_returns_result_when_complete(client, auth_headers, monkeypatch):
-    c, pool = client
+    c, _pool = client
     res = c.post("/api/ingest/drive", headers=auth_headers)
     job_id = res.json()["job_id"]
 
@@ -146,7 +147,7 @@ def test_ingest_status_404_for_unknown_job(client, auth_headers):
 
 
 def test_ingest_status_rejects_other_user(client, auth_headers):
-    c, pool = client
+    c, _pool = client
     res = c.post("/api/ingest/drive", headers=auth_headers)
     job_id = res.json()["job_id"]
 
@@ -162,17 +163,37 @@ def test_async_ingest_requires_auth(client):
     assert c.get("/api/ingest/status/job-1").status_code == 401
 
 
-def test_async_ingest_503_when_no_redis(monkeypatch):
-    import app.config as config
-    import app.auth as auth
+def test_async_ingest_503_when_no_redis(monkeypatch, tmp_path):
+    from app import auth, config
     monkeypatch.setattr(config, "JWT_SECRET", "test-secret")
     monkeypatch.setattr(auth, "JWT_SECRET", "test-secret")
     monkeypatch.setattr(config, "AUTH0_ENABLED", False)
     monkeypatch.setattr(auth, "AUTH0_ENABLED", False)
 
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from app import database
     from app.server import app
-    app.state.redis = None
+    test_engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
+    test_session = async_sessionmaker(test_engine, expire_on_commit=False)
+    monkeypatch.setattr(database, "engine", test_engine)
+    monkeypatch.setattr(database, "async_session", test_session)
     c = TestClient(app)
+
+    # Create schema for the sqlite DB (memberships/orgs required by the auth
+    # context dependency).
+    import asyncio
+
+    from app.database import Base
+
+    async def _create():
+        async with test_engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+    asyncio.run(_create())
+
+    app.state.redis = None
+
     headers = {"Authorization": f"Bearer {_make_token('test-secret', 'user1')}"}
     assert c.post("/api/ingest/drive", headers=headers).status_code == 503
     assert c.post("/api/ingest/slack", headers=headers).status_code == 503

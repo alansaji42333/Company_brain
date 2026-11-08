@@ -14,12 +14,12 @@ Covers:
   - End-to-end HTTP /api/v1/chat request-response cycle.
 """
 import json
-import pytest
-import httpx
-import respx
-from jose import jwt
-from fastapi.testclient import TestClient
 
+import httpx
+import pytest
+import respx
+from fastapi.testclient import TestClient
+from jose import jwt
 
 OLLAMA_URL = "http://ollama.test/v1"
 
@@ -32,9 +32,7 @@ def _make_token(secret: str, user_id: str = "user1") -> str:
 
 @pytest.fixture
 def app_client(monkeypatch, tmp_path):
-    import app.config as config
-    import app.auth as auth
-    import app.llm as llm
+    from app import auth, config, llm
 
     monkeypatch.setattr(config, "JWT_SECRET", "test-secret")
     monkeypatch.setattr(auth, "JWT_SECRET", "test-secret")
@@ -44,8 +42,9 @@ def app_client(monkeypatch, tmp_path):
     monkeypatch.setattr(llm, "OLLAMA_BASE_URL", OLLAMA_URL)
     monkeypatch.setattr(llm, "_client", None)
 
-    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
-    import app.database as database
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from app import database
     test_engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'agent.db'}")
     test_session = async_sessionmaker(test_engine, expire_on_commit=False)
     monkeypatch.setattr(database, "engine", test_engine)
@@ -81,7 +80,7 @@ def respx_router(monkeypatch):
     router = respx.mock(base_url=OLLAMA_URL)
     router.start()
     # Expose the router to fake_get_client.
-    import app.llm as llm
+    from app import llm
     llm.get_client._router = router  # type: ignore[attr-defined]
     try:
         yield router
@@ -97,8 +96,9 @@ def auth_headers():
 
 def _init_db(monkeypatch):
     import asyncio
+
+    from app import database
     from app.database import Base
-    import app.database as database
 
     async def _create():
         async with database.engine.begin() as conn:
@@ -108,7 +108,11 @@ def _init_db(monkeypatch):
 
 
 def _mock_retrieval(monkeypatch):
-    monkeypatch.setattr("app.agent.query_both", lambda question, top_k=None, user_id=None: {"raw": [], "skills": []})
+    # query_both is org-scoped: query_both(question, top_k=None, org_id=None, user_id=None)
+    def fake_query_both(question, top_k=None, org_id=None, user_id=None, **kwargs):
+        return {"raw": [], "skills": []}
+
+    monkeypatch.setattr("app.agent.query_both", fake_query_both)
 
 
 def _mock_tool_execute(monkeypatch, result=None):
@@ -308,12 +312,14 @@ def test_audit_log_on_tool_declined(app_client, respx_router, auth_headers, monk
 
 def test_audit_log_on_skill_approved_and_rejected(app_client, auth_headers, monkeypatch, tmp_path):
     _init_db(monkeypatch)
-    import app.config as config
-    import app.skill_store as skill_store
+    from app import config, skill_store
+    from app.orgs import personal_org_id
+
     skills_dir = tmp_path / "skills"
     monkeypatch.setattr(config, "SKILLS_DIR", str(skills_dir))
     monkeypatch.setattr(skill_store, "SKILLS_DIR", str(skills_dir))
-    skill_store.create_skill(title="Test Skill", summary="s", steps=["a"], source_chunk_ids=[], user_id="user1")
+    org_id = personal_org_id("user1")  # matches the auth context (no org claim -> personal org)
+    skill_store.create_skill(org_id, title="Test Skill", summary="s", steps=["a"], source_chunk_ids=[])
 
     monkeypatch.setattr("app.skill_store.add_chunks", lambda chunks, collection=None: None)
     app_client.post("/api/v1/skills/test-skill/approve", headers=auth_headers)
@@ -401,9 +407,13 @@ def test_ws_tool_proposal_records_audit(app_client, monkeypatch):
     with app_client.websocket_connect("/ws/chat") as ws:
         ws.send_json({"action": "auth", "token": token})
         ws.send_json({"action": "chat", "message": "send"})
+        events = []
         while True:
             evt = ws.receive_json()
-            if evt["type"] == "tool_proposal":
+            events.append(evt)
+            if evt.get("type") == "error":
+                raise AssertionError(f"Unexpected WS error event: {evt}")
+            if evt.get("type") == "tool_proposal":
                 break
 
     audit = app_client.get("/api/v1/audit", headers={"Authorization": f"Bearer {token}"}).json()["audit"]
