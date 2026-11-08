@@ -33,7 +33,8 @@ async def ingest_drive(
 
     - unchanged (same content_hash) → skip entirely (no re-embed, no delete);
     - changed → delete the doc's stored vectors, re-chunk + re-embed (`updated`);
-    - new → chunk + embed (`ingested`).
+    - new → chunk + embed (`ingested`);
+    - gone from the folder listing → vectors deleted (`deleted`).
     """
     from app import vectorstore
     from app.chunking import chunk_document, content_hash
@@ -41,12 +42,14 @@ async def ingest_drive(
 
     logger.info("job ingest_drive: folder_id=%s org_id=%s user_id=%s", folder_id, org_id, user_id)
     documents = ingest_drive_folder(folder_id, user_id=user_id, org_id=org_id)
+    folder_doc_ids = {doc["id"] for doc in documents}
 
     counts = {
         "files_processed": len(documents),
         "ingested": 0,
         "updated": 0,
         "skipped": 0,
+        "deleted": 0,
         "chunks_stored": 0,
     }
 
@@ -70,6 +73,17 @@ async def ingest_drive(
         vectorstore.add_chunks(chunks)
         counts["chunks_stored"] += len(chunks)
         counts["updated" if was_stored else "ingested"] += 1
+
+    # Deletion sweep: any drive doc still stored for this org but absent from
+    # the folder listing no longer exists at the source — remove its vectors.
+    # list_doc_ids/delete_by_doc_id filter on org_id, so this can never touch
+    # another org's chunks (even with identical doc_ids).
+    if org_id:
+        stored_doc_ids = vectorstore.list_doc_ids(org_id, "drive")
+        for gone_doc_id in sorted(stored_doc_ids - folder_doc_ids):
+            vectorstore.delete_by_doc_id(gone_doc_id, org_id)
+            counts["deleted"] += 1
+            logger.info("Swept deleted drive doc %s (org %s)", gone_doc_id, org_id)
 
     logger.info("job ingest_drive done: %s", counts)
     return counts

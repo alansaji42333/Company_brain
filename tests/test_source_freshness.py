@@ -266,3 +266,83 @@ def test_changed_drive_text_replaces_exactly_that_docs_vectors(fake_store, monke
     file2_id = vectorstore.stored_chunk_id(ORG, "file2", 0)
     assert file2_id in new_ids and file2_id in old_ids
     assert len(embed_calls) > n_embeds_before, "changed content re-embedded"
+
+
+# =====================================================================
+# 3. Drive: deletion sweep for docs removed from the folder
+# =====================================================================
+
+def test_removed_drive_doc_swept_from_store(fake_store, monkeypatch):
+    from app import vectorstore
+
+    collections, embed_calls = fake_store
+    fake = collections[vectorstore.COLLECTION_NAME]
+    gone = make_drive_doc("file_gone", "This file will be deleted from Drive.")
+    keep = make_drive_doc("file_keep", "This file stays in the folder.")
+
+    # Seed the store as if three prior ingests happened: file_gone, file_keep
+    # and another previously-removed doc with stale vectors.
+    run_drive_ingest(monkeypatch, [gone, keep])
+    assert fake.count() == 2
+    n_embeds_before = len(embed_calls)
+
+    # file_gone was deleted from the folder: the listing no longer has it.
+    result = run_drive_ingest(monkeypatch, [keep])
+
+    assert result["deleted"] == 1
+    assert result["skipped"] == 1
+    assert result["files_processed"] == 1
+    remaining_ids = set(fake.docs)
+    assert vectorstore.stored_chunk_id(ORG, "file_gone", 0) not in remaining_ids
+    assert vectorstore.stored_chunk_id(ORG, "file_keep", 0) in remaining_ids
+    assert len(embed_calls) == n_embeds_before, "sweep must not re-embed anything"
+
+
+def test_sweep_keeps_slack_vectors_of_same_org(fake_store, monkeypatch):
+    """The sweep matches source_type=drive only — slack chunks survive."""
+    from app import vectorstore
+
+    collections, _ = fake_store
+    fake = collections[vectorstore.COLLECTION_NAME]
+    fake.docs[vectorstore.stored_chunk_id(ORG, "slack_C123", 0)] = {
+        "document": "slack dialogue",
+        "metadata": {"doc_id": "slack_C123", "org_id": ORG, "source_type": "slack", "chunk_index": 0},
+    }
+
+    run_drive_ingest(monkeypatch, [])  # empty folder listing
+
+    assert vectorstore.stored_chunk_id(ORG, "slack_C123", 0) in fake.docs
+
+
+# =====================================================================
+# 5. Org isolation of the sweep
+# =====================================================================
+
+def test_org_A_sweep_never_touches_org_B_same_doc_id(fake_store, monkeypatch):
+    """Org A and org B both stored a doc with the SAME doc_id. Org A's file
+    disappears from its folder; org B's copy must survive untouched."""
+    from app import vectorstore
+
+    collections, embed_calls = fake_store
+    fake = collections[vectorstore.COLLECTION_NAME]
+    shared_doc = "shared_file_id"
+
+    doc_a = make_drive_doc(shared_doc, "Org A's copy of the file.", org_id="org_A")
+    doc_b = make_drive_doc(shared_doc, "Org B's copy of the file.", org_id="org_B")
+    run_drive_ingest(monkeypatch, [doc_a], org_id="org_A")
+    run_drive_ingest(monkeypatch, [doc_b], org_id="org_B")
+    assert fake.count() == 2
+    n_embeds_before = len(embed_calls)
+
+    # Org A's folder no longer contains the file; org B's still does.
+    result_a = run_drive_ingest(monkeypatch, [], org_id="org_A")
+    run_drive_ingest(monkeypatch, [doc_b], org_id="org_B")
+
+    assert result_a["deleted"] == 1
+    # Only org A's chunk is gone; org B's chunk with the same doc_id remains.
+    assert fake.count() == 1
+    remaining = fake.get(where={"org_id": "org_B"})["metadatas"]
+    assert len(remaining) == 1
+    assert remaining[0]["doc_id"] == shared_doc
+    assert remaining[0]["org_id"] == "org_B"
+    assert len(embed_calls) == n_embeds_before, "isolation sweep must not re-embed"
