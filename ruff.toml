@@ -1,3 +1,4 @@
+target-version = "py311"
 line-length = 140
 
 [lint.flake8-bugbear]
@@ -10,4 +11,7 @@ extend-immutable-calls = ["fastapi.Depends", "fastapi.Header"]
 # BLE001: the codebase deliberately uses broad `except Exception` blocks that
 # log (logger.exception) and continue at request/ingest/LLM boundaries — a
 # failed integration must not take down the calling path.
-ignore = ["BLE001"]
+# UP017: 14 cosmetic `timezone.utc` → `datetime.UTC` alias rewrites across the
+# repo; pinned target-version = py311 makes ruff flag them, but they are pure
+# churn — deliberately NOT applied (results stay stable across ruff versions).
+ignore = ["BLE001", "UP017"]
