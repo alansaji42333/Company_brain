@@ -5,6 +5,8 @@ collection surface is replaced by an in-memory fake collection, `embed` by a
 recording stub, and the Drive/Slack pipelines by monkeypatched functions at
 their seams (same style as tests/test_ingest_jobs.py and conftest env).
 """
+import asyncio
+
 import pytest
 
 
@@ -180,3 +182,87 @@ def test_list_doc_ids_dedupes_per_org_and_source_type(fake_store):
 
     assert vectorstore.list_doc_ids("orgA", "slack") == {"slack_C123"}
     assert vectorstore.list_doc_ids("orgB", "drive") == {"doc1"}
+
+
+# =====================================================================
+# 2. Drive: hash-based skip / update
+# =====================================================================
+
+ORG = "org_tenant1"
+
+
+def run_drive_ingest(monkeypatch, documents, org_id: str = ORG) -> dict:
+    """Run the real `ingest_drive` worker job against a scripted folder and
+    the fake vector store."""
+    from app import drive_ingest
+    from app.worker import ingest_drive
+
+    monkeypatch.setattr(drive_ingest, "ingest_drive_folder", lambda *a, **kw: list(documents))
+    return asyncio_run_job(ingest_drive, {}, folder_id="folder1", user_id="scheduler", org_id=org_id)
+
+
+def asyncio_run_job(coro_fn, ctx: dict, **kwargs) -> dict:
+    return asyncio.run(coro_fn(ctx, **kwargs))
+
+
+def test_unchanged_drive_doc_skipped_on_reingest(fake_store, monkeypatch):
+    from app import vectorstore
+    from app.chunking import content_hash
+
+    collections, embed_calls = fake_store
+    fake = collections[vectorstore.COLLECTION_NAME]
+    doc = make_drive_doc("file1", "The quarterly security overview document.")
+
+    first = run_drive_ingest(monkeypatch, [doc])
+    assert first["ingested"] == 1
+    assert first["skipped"] == 0
+    assert first["chunks_stored"] == 1
+    assert len(fake.docs) == 1
+
+    n_embeds_after_first = len(embed_calls)
+    second = run_drive_ingest(monkeypatch, [doc])
+
+    assert second["skipped"] == 1
+    assert second["ingested"] == 0 and second["updated"] == 0
+    assert second["chunks_stored"] == 0
+    assert len(embed_calls) == n_embeds_after_first, "unchanged content must not re-embed"
+    assert fake.count() == 1
+    stored_meta = fake.get()["metadatas"][0]
+    assert stored_meta["content_hash"] == content_hash(doc["text"])
+
+
+def test_changed_drive_text_replaces_exactly_that_docs_vectors(fake_store, monkeypatch):
+    from app import vectorstore
+
+    collections, embed_calls = fake_store
+    fake = collections[vectorstore.COLLECTION_NAME]
+    filler = "Old content sentence that is long enough. " * 200
+    other = make_drive_doc("file2", "Some other stable content.")
+    old_text = filler + " extra tail to push chunk count up"
+    run_drive_ingest(monkeypatch, [make_drive_doc("file1", old_text), other])
+    old_ids = set(fake.docs)
+    assert len(old_ids) >= 3  # multi-chunk doc1 + one chunk of file2
+    n_embeds_before = len(embed_calls)
+
+    new_text = "Brand new, very short content."
+    result = run_drive_ingest(monkeypatch, [make_drive_doc("file1", new_text), other])
+
+    assert result["updated"] == 1
+    # unchanged doc2 skipped
+    assert result["skipped"] == 1
+    # only the new chunk set for file1 remains; other chunks untouched
+    new_ids = set(fake.docs)
+    gone = old_ids - new_ids
+    assert all("file1" in chunk_id for chunk_id in gone), "only file1's old chunks deleted"
+    assert all("file2" not in chunk_id for chunk_id in gone), "unchanged file2 not deleted"
+    # every surviving file1 chunk now carries the NEW content (index 0 was
+    # overwritten in place by the upsert; higher indexes were deleted)
+    file1_new = {
+        cid: fake.docs[cid] for cid in new_ids if "file1" in cid
+    }
+    assert set(file1_new) == {vectorstore.stored_chunk_id(ORG, "file1", 0)}
+    assert "Brand new, very short content." in next(iter(file1_new.values()))["document"]
+    # file2's stored chunk is byte-identical to before (untouched)
+    file2_id = vectorstore.stored_chunk_id(ORG, "file2", 0)
+    assert file2_id in new_ids and file2_id in old_ids
+    assert len(embed_calls) > n_embeds_before, "changed content re-embedded"

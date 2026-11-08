@@ -1,8 +1,20 @@
+import hashlib
+
 import tiktoken
 
 from app.config import CHUNK_OVERLAP, CHUNK_SIZE
 
 encoder = tiktoken.get_encoding("cl100k_base")
+
+
+def content_hash(text: str) -> str:
+    """Deterministic content hash of a document's full extracted text.
+
+    Used as ingest change detection: every chunk of one document is stamped
+    with the SAME hash; an ingest compares it against the stored metadata and
+    skips re-embedding when unchanged.
+    """
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def token_count(text: str) -> int:
@@ -34,6 +46,7 @@ def chunk_document(doc: dict, user_id: str = "", org_id: str = "") -> list[dict]
             "text": chunk_text,
             "user_id": user_id,
             "org_id": org_id,
+            "content_hash": content_hash(text),
             **extra_fields,
         })
 

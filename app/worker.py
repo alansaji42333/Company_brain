@@ -29,17 +29,50 @@ def redis_settings() -> RedisSettings:
 async def ingest_drive(
     ctx: dict, folder_id: str | None = None, user_id: str = "", org_id: str = "",
 ) -> dict:
-    """Ingest a Google Drive folder: extract → chunk → embed → store."""
-    from app.chunking import chunk_documents
+    """Ingest a Google Drive folder fresh-first, per document:
+
+    - unchanged (same content_hash) → skip entirely (no re-embed, no delete);
+    - changed → delete the doc's stored vectors, re-chunk + re-embed (`updated`);
+    - new → chunk + embed (`ingested`).
+    """
+    from app import vectorstore
+    from app.chunking import chunk_document, content_hash
     from app.drive_ingest import ingest_drive_folder
-    from app.vectorstore import add_chunks
 
     logger.info("job ingest_drive: folder_id=%s org_id=%s user_id=%s", folder_id, org_id, user_id)
     documents = ingest_drive_folder(folder_id, user_id=user_id, org_id=org_id)
-    chunks = chunk_documents(documents, user_id=user_id, org_id=org_id)
-    add_chunks(chunks)
-    logger.info("job ingest_drive done: %d files, %d chunks", len(documents), len(chunks))
-    return {"files_processed": len(documents), "chunks_stored": len(chunks)}
+
+    counts = {
+        "files_processed": len(documents),
+        "ingested": 0,
+        "updated": 0,
+        "skipped": 0,
+        "chunks_stored": 0,
+    }
+
+    for doc in documents:
+        doc_id = doc["id"]
+        new_hash = content_hash(doc["text"])
+        stored = vectorstore.get_doc_chunk_metadatas(doc_id, org_id)
+        stored_hashes = {m.get("content_hash") for m in stored}
+
+        if stored and stored_hashes == {new_hash}:
+            counts["skipped"] += 1
+            continue
+
+        was_stored = bool(stored)
+        if was_stored:
+            # Replace: content changed — drop the old vectors first so the
+            # fresh set is the only set (chunk count may differ).
+            vectorstore.delete_by_doc_id(doc_id, org_id)
+
+        chunks = chunk_document(doc, user_id=user_id, org_id=org_id)
+        vectorstore.add_chunks(chunks)
+        counts["chunks_stored"] += len(chunks)
+        counts["updated" if was_stored else "ingested"] += 1
+
+    logger.info("job ingest_drive done: %s", counts)
+    return counts
 
 
 async def ingest_slack(ctx: dict, user_id: str = "", org_id: str = "") -> dict:
