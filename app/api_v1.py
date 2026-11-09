@@ -477,6 +477,127 @@ async def put_drive_connector(
     return {"org_id": org_id, "source": "drive", "configured": True}
 
 
+# --- Drive OAuth self-serve onboarding --------------------------------------
+# The browser flow for org admins: start → Google consent → callback.
+# The signed state JWT IS the callback's authorization (Google's redirect
+# carries no Authorization header). app/drive_oauth.py holds the crypto and
+# the code exchange; app/connectors.py the encrypted storage.
+
+_CONNECTORS_PAGE = "/connectors"  # frontend route where the UI shows result
+
+
+def _drive_oauth_unavailable_error() -> HTTPException:
+    return HTTPException(
+        status_code=503,
+        detail=(
+            "Drive OAuth onboarding is disabled: set GOOGLE_OAUTH_CLIENT_ID, "
+            "GOOGLE_OAUTH_CLIENT_SECRET and GOOGLE_OAUTH_REDIRECT_URI to enable it"
+        ),
+    )
+
+
+@router.get("/orgs/{org_id}/connectors/drive/oauth/start")
+async def start_drive_oauth(
+    org_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    folder_id: str | None = None,
+    ctx: AuthContext = Depends(require_admin),
+):
+    """Begin the Drive OAuth flow: 302 the admin's browser to Google.
+
+    Same admin + membership checks as the manual PUT endpoint. `folder_id`
+    becomes part of the signed state and ends up in the stored connector.
+    """
+    from app import drive_oauth
+
+    _require_member_of(ctx, org_id)
+    org = await get_organization(db, org_id)
+    if org is None:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    if not drive_oauth.oauth_configured():
+        raise _drive_oauth_unavailable_error()
+    if not folder_id or not folder_id.strip():
+        raise HTTPException(status_code=400, detail="folder_id is required to configure the Drive connector")
+
+    from fastapi.responses import RedirectResponse
+
+    try:
+        state = drive_oauth.make_state(org_id, ctx.user_id, folder_id.strip())
+    except RuntimeError as e:
+        # e.g. no signing secret — fail fast with a clear message, not a 500.
+        raise HTTPException(status_code=503, detail=str(e)) from None
+    logger.info("Drive OAuth started for org %s user %s", org_id, ctx.user_id)
+    return RedirectResponse(drive_oauth.build_authorize_url(state), status_code=302)
+
+
+@router.get("/orgs/{org_id}/connectors/drive/oauth/callback")
+async def drive_oauth_callback(
+    org_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    code: str | None = None,
+    state: str | None = None,
+):
+    """Finish the Drive OAuth flow: exchange the code, store the connector,
+    audit it, and 302 back to the frontend's connectors page.
+
+    No Authorization header exists on this route by design — the verified
+    signed state (org_user folder expiry) is the authorization.
+    """
+    from fastapi.responses import RedirectResponse
+
+    from app import audit, connectors, drive_oauth
+    from app.config import FRONTEND_URL
+
+    if not drive_oauth.oauth_configured():
+        raise _drive_oauth_unavailable_error()
+
+    def _fail(reason: str) -> RedirectResponse:
+        return RedirectResponse(
+            f"{FRONTEND_URL}{_CONNECTORS_PAGE}?drive=error&reason={reason}", status_code=302
+        )
+
+    if not code or not state:
+        return _fail("missing_params")
+
+    try:
+        claims = drive_oauth.verify_state(state, org_id)
+    except drive_oauth.OAuthStateError as e:
+        logger.warning("Drive OAuth state rejected (%s)", e.reason)
+        return _fail(e.reason)
+
+    try:
+        token_json = drive_oauth.exchange_code(code, drive_oauth.web_client_dict()["web"])
+    except Exception:
+        # Never log raw exception text (token URLs etc.); short safe reason.
+        logger.error("Drive OAuth code exchange failed for org %s", org_id)
+        return _fail("exchange_failed")
+
+    if not token_json.get("refresh_token"):
+        # Offline access must yield a refresh_token; prompt=consent forces it.
+        # A token without one cannot keep working long-term — save nothing.
+        return _fail("no_refresh_token")
+
+    config = {
+        "folder_id": claims["folder_id"],
+        "credentials_json": drive_oauth.web_client_dict()["web"],
+        "token_json": token_json,
+    }
+    try:
+        await connectors.set_connector(db, org_id, "drive", config, claims["user_id"])
+    except ValueError as e:
+        logger.error("Drive OAuth callback rejected config for org %s: %s", org_id, e)
+        return _fail("invalid_config")
+    await db.commit()
+    await audit.record(
+        db, org_id, claims["user_id"], audit.ACTION_CONNECTOR_SET, payload={"source": "drive", "via": "oauth"}
+    )
+    await db.commit()
+    logger.info("Drive connector stored via OAuth for org %s user %s", org_id, claims["user_id"])
+    return RedirectResponse(f"{FRONTEND_URL}{_CONNECTORS_PAGE}?drive=connected", status_code=302)
+
+
 @router.delete("/orgs/{org_id}/connectors/{source}")
 async def delete_org_connector(
     org_id: str,

@@ -90,6 +90,15 @@ AUTH0_JWKS_CACHE_TTL: int = int(os.getenv("AUTH0_JWKS_CACHE_TTL", "3600"))
 CORS_ORIGINS: str = os.getenv("CORS_ORIGINS", "*")
 RATE_LIMIT: str = os.getenv("RATE_LIMIT", "30/minute")
 
+# Drive OAuth onboarding (self-serve connector setup) ------------------------
+# One deployment-level OAuth client of type "Web application" (NOT the
+# installed-app credentials.json used by google_auth.py's headless path).
+GOOGLE_OAUTH_CLIENT_ID: str = os.getenv("GOOGLE_OAUTH_CLIENT_ID", "")
+GOOGLE_OAUTH_CLIENT_SECRET: str = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET", "")
+# Absolute callback URL, e.g. https://<host>/api/v1/orgs/some_org_id/connectors/drive/oauth/callback
+GOOGLE_OAUTH_REDIRECT_URI: str = os.getenv("GOOGLE_OAUTH_REDIRECT_URI", "")
+FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:5173")
+
 # Redis / background jobs --------------------------------------------------
 REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
@@ -130,4 +139,20 @@ def validate_config():
         # policy must never be combined with real authentication.
         raise RuntimeError(
             "AUTH0_ENABLED is true but CORS_ORIGINS is '*': set explicit origins"
+        )
+    GOOGLE_OAUTH_REQUIRED = ("GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET", "GOOGLE_OAUTH_REDIRECT_URI")
+    if AUTH0_ENABLED:
+        # With real (Auth0) login, self-serve Drive onboarding is part of the
+        # setup — require the whole OAuth web-flow config so a missing piece
+        # fails at startup instead of as a broken UI flow.
+        if not FRONTEND_URL:
+            raise RuntimeError("AUTH0_ENABLED is true but FRONTEND_URL is not set")
+        not_set = [name for name, value in zip(GOOGLE_OAUTH_REQUIRED, (GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET, GOOGLE_OAUTH_REDIRECT_URI)) if not value]
+        if not_set:
+            raise RuntimeError(f"AUTH0_ENABLED is true but {', '.join(not_set)} not set")
+    elif not (GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET and GOOGLE_OAUTH_REDIRECT_URI):
+        logger.warning(
+            "Drive OAuth onboarding disabled: set GOOGLE_OAUTH_CLIENT_ID, "
+            "GOOGLE_OAUTH_CLIENT_SECRET, GOOGLE_OAUTH_REDIRECT_URI to enable "
+            "self-serve Drive connector setup in the UI"
         )
