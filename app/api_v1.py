@@ -21,6 +21,7 @@ from app.orgs import (
     create_org,
     get_organization,
     list_members,
+    list_user_orgs,
     remove_member,
     set_member_role,
 )
@@ -294,6 +295,19 @@ async def create_organization(
         "slug": org.slug,
         "role": ROLE_ADMIN,
     }
+
+
+@router.get("/orgs")
+async def list_my_orgs(
+    db: AsyncSession = Depends(get_db),
+    ctx: AuthContext = Depends(get_auth_context),
+):
+    """Orgs the caller belongs to (for the client's org switcher).
+
+    Switching is a client hint (`X-Org-Id`): every request still resolves
+    and verifies the membership server-side.
+    """
+    return {"orgs": await list_user_orgs(db, ctx.user_id)}
 
 
 @router.get("/orgs/me")

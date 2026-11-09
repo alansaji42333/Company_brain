@@ -120,3 +120,14 @@ def validate_config():
         raise RuntimeError(f"Missing required config: {', '.join(missing)}")
     if AUTH0_ENABLED and not AUTH0_DOMAIN:
         raise RuntimeError("AUTH0_ENABLED is true but AUTH0_DOMAIN is not set")
+    if AUTH0_ENABLED and not AUTH0_AUDIENCE:
+        # Without an audience Auth0 issues opaque/other-audience tokens the
+        # API cannot verify — every request would be rejected. Require it
+        # explicitly so a misconfigured deployment fails at startup.
+        raise RuntimeError("AUTH0_ENABLED is true but AUTH0_AUDIENCE is not set")
+    if AUTH0_ENABLED and CORS_ORIGINS.strip() == "*":
+        # The SPA sends Authorization headers cross-origin; a wildcard CORS
+        # policy must never be combined with real authentication.
+        raise RuntimeError(
+            "AUTH0_ENABLED is true but CORS_ORIGINS is '*': set explicit origins"
+        )

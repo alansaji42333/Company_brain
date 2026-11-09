@@ -138,6 +138,21 @@ async def list_all_org_ids(db: AsyncSession) -> list[str]:
     return list(result.scalars().all())
 
 
+async def list_user_orgs(db: AsyncSession, user_id: str) -> list[dict]:
+    """Orgs `user_id` is a member of (id/name/slug/role) — for the client's
+    org switcher. Read-only; membership is by definition verified here."""
+    result = await db.execute(
+        select(Organization, Membership)
+        .join(Membership, Membership.org_id == Organization.id)
+        .where(Membership.user_id == user_id)
+        .order_by(Organization.name, Organization.id)
+    )
+    return [
+        {"id": org.id, "name": org.name, "slug": org.slug, "role": membership.role}
+        for org, membership in result.all()
+    ]
+
+
 # --- membership management -------------------------------------------------
 
 async def list_members(db: AsyncSession, org_id: str) -> list[dict]:
