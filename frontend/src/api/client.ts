@@ -58,6 +58,28 @@ export interface ConversationSummary {
   updated_at: string;
 }
 
+export interface OrgMember {
+  user_id: string;
+  role: string;
+  created_at: string | null;
+}
+
+export interface MyOrg {
+  user_id: string;
+  id: string;
+  name: string;
+  slug: string;
+  role: string;
+  members: OrgMember[];
+}
+
+export interface MyOrgSummary {
+  id: string;
+  name: string;
+  slug: string;
+  role: string;
+}
+
 export interface ToolProposal {
   type: "tool_proposal";
   tool_id: string;
@@ -86,17 +108,71 @@ export interface ChatStreamHandlers {
 
 const API_BASE = "/api/v1";
 
-function token(): string {
-  return localStorage.getItem("auth_token") || "";
+// --- auth plumbing -----------------------------------------------------------
+// The access token comes from a registered getter — Auth0's
+// `getAccessTokenSilently` in production (no JWT ever stored client-side),
+// or the dev paste-token flow (localStorage "auth_token") when the app runs
+// without VITE_AUTH0_* config. Fetches attach it as a Bearer token; the
+// WebSocket auth message also carries the active-org hint.
+type TokenGetter = (forceRefresh?: boolean) => Promise<string>;
+
+let tokenGetter: TokenGetter = async () => localStorage.getItem("auth_token") || "";
+let onUnauthorized: (() => void) | null = null;
+
+/**
+ * Register the app's auth callbacks (called once on startup, after sign-in).
+ * `tokenGetter(force)` must return the access token, refreshing it when
+ * stale — `force` asks the underlying provider to bypass any cache.
+ * `onUnauthorized` fires when a request still gets 401 after one silent
+ * re-auth retry; the app then returns the user to the sign-in screen.
+ */
+export function registerAuth(options: { tokenGetter: TokenGetter; onUnauthorized?: () => void }): void {
+  tokenGetter = options.tokenGetter;
+  onUnauthorized = options.onUnauthorized ?? null;
 }
 
-function authHeaders(extra: HeadersInit = {}): HeadersInit {
-  return { Authorization: `Bearer ${token()}`, ...extra };
+// Active org hint (org switcher). Membership is always verified
+// server-side; this only selects WHICH verified membership applies.
+let activeOrgId = localStorage.getItem("active_org_id") || "";
+
+export function getActiveOrgId(): string {
+  return activeOrgId;
+}
+
+export function setActiveOrgId(orgId: string | null): void {
+  activeOrgId = orgId || "";
+  if (activeOrgId) localStorage.setItem("active_org_id", activeOrgId);
+  else localStorage.removeItem("active_org_id");
+}
+
+function extraHeaders(extra: HeadersInit | undefined): Record<string, string> {
+  // All internal callers pass plain objects; Headers/arrays are not used.
+  return { ...((extra as Record<string, string>) || {}) };
+}
+
+async function requestOnce(path: string, init: RequestInit, tokenValue: string, orgValue: string): Promise<Response> {
+  const headers = extraHeaders(init.headers);
+  headers.Authorization = `Bearer ${tokenValue}`;
+  if (orgValue) headers["X-Org-Id"] = orgValue;
+  return fetch(`${API_BASE}${path}`, { ...init, headers });
 }
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const headers = authHeaders(init.headers);
-  const res = await fetch(`${API_BASE}${path}`, { ...init, headers });
+  let res = await requestOnce(path, init, await tokenGetter(), activeOrgId);
+  if (res.status === 401) {
+    // One silent re-auth retry with a forcibly refreshed token. If that
+    // still gets a 401 the session is unusable — hand the user to the
+    // sign-in screen.
+    let refreshed = false;
+    try {
+      await tokenGetter(true);
+      res = await requestOnce(path, init, await tokenGetter(), activeOrgId);
+      refreshed = res.status !== 401;
+    } catch {
+      refreshed = false;
+    }
+    if (!refreshed) onUnauthorized?.();
+  }
   if (!res.ok) {
     const detail = await res.text();
     throw new Error(detail || `Request failed: ${res.status}`);
@@ -121,14 +197,26 @@ export const api = {
 
   // Streaming chat over WebSocket.
   // Returns the open WebSocket. The caller must authenticate by sending
-  // {action:"auth", token} immediately after connecting — handled here on open.
+  // {action:"auth", token} immediately after connecting — handled here on
+  // open with a FRESH token from the registered getter (plus the active-org
+  // hint when one is selected).
   openChatStream: (handlers: ChatStreamHandlers): WebSocket => {
     const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
     const wsUrl = `${proto}//${window.location.host}/ws/chat`;
     const ws = new WebSocket(wsUrl);
 
     ws.onopen = () => {
-      ws.send(JSON.stringify({ action: "auth", token: token() }));
+      void (async () => {
+        try {
+          const tokenValue = await tokenGetter();
+          const authMessage: Record<string, unknown> = { action: "auth", token: tokenValue };
+          if (activeOrgId) authMessage.org_id = activeOrgId;
+          ws.send(JSON.stringify(authMessage));
+        } catch {
+          handlers.onError?.("Sign-in required");
+          ws.close();
+        }
+      })();
     };
     ws.onmessage = (ev) => {
       try {
@@ -200,8 +288,12 @@ export const api = {
   // Conversations
   listConversations: () => request<{ conversations: ConversationSummary[] }>("/conversations"),
 
-  // Auth
+  // Auth / org context
+  getMyOrg: () => request<MyOrg>("/orgs/me"),
+  listMyOrgs: () => request<{ orgs: MyOrgSummary[] }>("/orgs"),
+
+  // Dev mode only (no VITE_AUTH0_* config): keep the paste-token flow.
   setToken: (t: string) => localStorage.setItem("auth_token", t),
-  getToken: () => token(),
+  getToken: () => localStorage.getItem("auth_token") || "",
   clearToken: () => localStorage.removeItem("auth_token"),
 };

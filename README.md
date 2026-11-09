@@ -7,7 +7,7 @@ A local RAG (retrieval-augmented generation) pipeline that ingests documents fro
 - **Python 3.11+**
 - **Google Cloud project** with the Drive API, Calendar API, and Sheets API enabled
 - **Slack App** with appropriate scopes (for Slack ingestion and messaging)
-- **Anthropic API key**
+- **Ollama account** — an API key (`OLLAMA_API_KEY`) and the API base URL (`OLLAMA_BASE_URL`)
 
 ### Google Cloud / API setup
 
@@ -54,7 +54,9 @@ cp .env.example .env
 ```
 
 Required variables:
-- `ANTHROPIC_API_KEY` — your Anthropic API key
+- `OLLAMA_API_KEY` — your Ollama API key (the LLM is Ollama, not Anthropic)
+- `OLLAMA_BASE_URL` — Ollama API base URL (e.g. `https://ollama.com/v1`)
+- `LLM_MODEL` — the model used for chat and skill synthesis
 - `GOOGLE_DRIVE_FOLDER_ID` — the ID of the Drive folder to ingest
 - `SLACK_BOT_TOKEN` — your Slack bot token (xoxb-...)
 - `SLACK_CHANNEL_IDS` — comma-separated Slack channel IDs
@@ -66,6 +68,80 @@ Optional tunables:
 - `CHUNK_OVERLAP` — overlap between chunks (default: 50)
 - `TOP_K_RETRIEVAL` — number of chunks to retrieve per query (default: 5)
 - `LEGACY_CONNECTOR_ORG_ID` — exact org id allowed to use the global connector credentials; empty binds nobody (see "Legacy connector binding" under Notes)
+
+## Login setup
+
+Out of the box the app runs in **dev mode**: users paste a JWT (or a
+backend-issued token from `/api/v1/login`, HS256 with `JWT_SECRET`). To
+replace the paste-token box with **Auth0 Universal Login**, do the following
+once in your Auth0 tenant.
+
+### 1. Auth0: create the SPA application
+
+Dashboard → Applications → Create Application → type **Single Page
+Application**. In its settings record the **Client ID** and **Domain**, and
+set the URLs (use your frontend origin in production, e.g.
+`https://app.companybrain.example`; for `npm run dev` use
+`http://localhost:5173`):
+
+- **Allowed Callback URLs** — the frontend origin exactly (Auth0 redirects
+  there with the authorization code after login).
+- **Allowed Logout URLs** — the same origin (where users land after
+  sign-out).
+- **Allowed Web Origins** — the same origin (lets the SDK refresh tokens
+  silently in the background).
+
+Grant type **Authorization Code** with **Refresh Token** enabled (the SDK
+uses Authorization Code + PKCE; there are no client secrets involved).
+
+### 2. Auth0: create the API (audience)
+
+Dashboard → APIs → Create API. Name it (e.g. "Company Brain API") and set
+the **Identifier (audience)** to an opaque URI such as
+`https://api.company-brain.example`. This exact string becomes
+`AUTH0_AUDIENCE` on the backend and `VITE_AUTH0_AUDIENCE` on the frontend —
+without it Auth0 does not issue verifiable access tokens, and the backend's
+startup check (`validate_config`) refuses to boot.
+
+### 3. Backend env vars (`.env`, server side)
+
+```
+AUTH0_ENABLED=true
+AUTH0_DOMAIN=your-tenant.auth0.com        # from step 1
+AUTH0_AUDIENCE=https://api.company-brain.example   # from step 2
+JWT_SECRET=<random secret>                # still needed for session-internal signing (HS256 dev fallback)
+CORS_ORIGINS=https://app.companybrain.example   # explicit origins ONLY — '*' is rejected at startup with Auth0 on
+```
+
+With `AUTH0_ENABLED=true` the API verifies RS256 access tokens against the
+tenant's JWKS endpoint (cached, configurable via `AUTH0_JWKS_CACHE_TTL`
+seconds) instead of accepting shared-secret JWTs.
+
+### 4. Frontend env vars (frontend/.env.local or the build environment)
+
+```
+VITE_AUTH0_DOMAIN=your-tenant.auth0.com   # from step 1
+VITE_AUTH0_CLIENT_ID=<SPA client id>      # from step 1
+VITE_AUTH0_AUDIENCE=https://api.company-brain.example   # MUST match AUTH0_AUDIENCE
+```
+
+These are read at build time (`VITE_*` is baked into the bundle), so rebuild
+the frontend after changing them. While `VITE_AUTH0_DOMAIN` is unset the
+frontend shows the "Dev mode" paste-token screen; once set, users see a
+single "Sign in" button that opens Auth0's Universal Login page, and the app
+receives the user back with a session (Authorization Code + PKCE) — no token
+ever appears in the UI.
+
+### 5. What happens at first login
+
+- The frontend calls `GET /api/v1/orgs/me` with the access token.
+- A brand-new user automatically gets a **personal org** (created lazily
+  server-side; they are its admin).
+- The nav shows the org name and the user's role. Users in several orgs get
+  an **org switcher** (a `<select>` that sends the `X-Org-Id` header); every
+  request still verifies membership server-side, so a switched org you are
+  not a member of is a 403.
+- "Sign out" redirects to your **Allowed Logout URL**.
 
 ## Usage
 
