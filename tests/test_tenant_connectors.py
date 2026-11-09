@@ -1118,23 +1118,33 @@ def test_db_load_failure_fails_closed_for_unbound_org(
     assert not any("boom-SENSITIVE" in r.getMessage() for r in caplog.records)
 
 
-def test_db_load_failure_bound_legacy_org_keeps_fallback(
-    tenant_db, fake_store, slack_env, drive_env, monkeypatch,
+def test_db_load_failure_bound_legacy_org_also_fails_closed(
+    tenant_db, fake_store, slack_env, drive_env, destructive_spies, monkeypatch,
 ):
-    """A (explicitly bound): a store unavailability permits the env/file
-    fallback — but ONLY through the same centralized resolver gate."""
+    """Even the explicitly bound legacy org fails closed on a store load
+    failure: error result, NO env credentials used, no source/vector work.
+    An uncertain store must never authorize global credentials."""
     from app import connectors as c
-    from app import slack_ingest
+    from app import slack_ingest, vectorstore
 
     _bind_legacy(monkeypatch, LEGACY_ORG)
     _, FakeWebClient = slack_env
     records, _sentinel = drive_env
+    spies, embed_calls = destructive_spies
+    collections, _ = fake_store
 
     async def failing_load(db, org_id, source):
         raise RuntimeError("db unreachable")
 
-    monkeypatch.setattr(c, "get_connector", failing_load)
+    monkeypatch.setattr(c, "get_connector", failing_load)  # the DB-load boundary
 
+    fake = collections[vectorstore.COLLECTION_NAME]
+    _seed_org_vectors(vectorstore, fake, LEGACY_ORG, "slack_C-seed", "slack")
+    _seed_org_vectors(vectorstore, fake, LEGACY_ORG, "seed-doc-A", "drive")
+    before = _snapshot_vector_state(collections, spies, embed_calls)
+
+    # Slack: env token + channels are firmly in place (bound org), yet the
+    # job must not use them.
     FakeWebClient.history["C-GLOBAL-1"] = [{"ts": "900.000", "user": "U1", "text": "fallback works"}]
     monkeypatch.setattr(
         slack_ingest, "ingest_slack_channel",
@@ -1142,14 +1152,21 @@ def test_db_load_failure_bound_legacy_org_keeps_fallback(
     )
 
     result = run_slack_job(LEGACY_ORG)
-    assert result["channels"] == 2 and result["chunks_stored"] == 2
-    assert FakeWebClient.constructed == [GLOBAL_SLACK_TOKEN], "env token used for the bound org"
+    assert result == {
+        "error": f"no slack connector configured for org {LEGACY_ORG}",
+        "channels": 0, "chunks_stored": 0, "chunks_deleted": 0,
+    }
+    assert FakeWebClient.constructed == [], "env token must NOT be used after a store failure"
 
+    # Drive: same fail-closed behavior on the file/env path.
     result = run_drive_job(LEGACY_ORG)
-    assert result["ingested"] == 1
-    assert records["services"] == [None], "credentials=None → drive_ingest's file/env path for the bound org"
-    assert records["credentials_calls"] == [], "the headless per-org google_auth path is NOT used for legacy fallback"
-    assert records["folders"] == ["F-GLOBAL-DISTINCT"]
+    assert result == {
+        "error": f"no drive connector configured for org {LEGACY_ORG}",
+        "files_processed": 0, "chunks_stored": 0,
+    }
+    assert records["credentials_calls"] == [] and records["folders"] == [] and records["services"] == []
+
+    _assert_vector_state_untouched(collections, spies, embed_calls, before)
 
 
 # --- corrupt stored config ----------------------------------------------------

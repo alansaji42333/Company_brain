@@ -202,6 +202,12 @@ How resolution works for every ingest job (API-triggered or scheduled):
    replacement, or deletion sweeps, and reports
    `no <source> connector configured for org <org_id>`.
 
+If the connector store itself cannot be read (database down, table
+missing) or a stored config is corrupt/undecryptable, ingest stops for
+**all** orgs — including the bound legacy org. An uncertain store never
+authorizes the global credentials; the job reports an error result, is
+audited, and nothing is authenticated, fetched, stored, or swept.
+
 **Upgrading an existing single-tenant deployment:** you keep running
 exactly as before, but you must explicitly set
 `LEGACY_CONNECTOR_ORG_ID` to the org id that should own the global
