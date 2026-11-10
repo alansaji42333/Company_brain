@@ -85,10 +85,14 @@ function driveErrorText(reason: string): string {
       return "Google did not grant a refresh token. Reconnect and make sure to approve the consent screen (it re-issues long-term access).";
     case "expired_state":
       return "The Drive setup session timed out. Start the connection again.";
-    case "org_mismatch":
-      return "The setup session belongs to a different organization. Start the connection from the right org.";
-    case "invalid_state":
-      return "The Drive setup session is no longer valid. Start the connection again.";
+    case "unknown_state":
+      return "The Drive setup session is unknown (it may have been abandoned). Start the connection again.";
+    case "consumed_state":
+      return "That Drive setup session was already used. Start the connection again — do not reuse old links.";
+    case "browser_mismatch":
+      return "The Drive setup must be completed in the browser that started it. Start the connection again here.";
+    case "revoked":
+      return "The admin who started this connection no longer has admin access. Ask a current admin to connect Drive.";
     case "missing_params":
       return "Google Drive did not return the expected data. Start the connection again.";
     case "exchange_failed":
@@ -118,16 +122,20 @@ function DriveCard(
 
   const connected = Boolean(connector?.configured);
 
-  const startOAuth = () => {
-    // Full-page navigation: this backend route 302s the browser to Google's
-    // consent screen, then Google returns to the backend callback, which
-    // 302s back to /connectors with ?drive=connected|error.
+  const startOAuth = async () => {
+    // The start call MUST go through the authenticated api client (a plain
+    // navigation sends no Authorization header and would get a 401). The
+    // backend returns {"authorize_url"} plus the browser-binding cookie;
+    // navigating to the URL then walks Google consent → the backend's
+    // org-less callback → back to /connectors with ?drive=connected|error.
     setStarting(true);
-    window.location.assign(
-      `/api/v1/orgs/${encodeURIComponent(orgId)}/connectors/drive/oauth/start?folder_id=${
-        encodeURIComponent(folderId.trim())
-      }`,
-    );
+    try {
+      const res = await api.startDriveOAuth(orgId, folderId.trim());
+      window.location.assign(res.authorize_url);
+    } catch (e: unknown) {
+      setStarting(false);
+      onError(e instanceof Error ? e.message : String(e));
+    }
   };
 
   const runSync = async () => {
@@ -254,8 +262,8 @@ function SlackCard(
           <br />
           <button
             onClick={save}
-            disabled={!botToken.trim() || saving || channels.split(/[,\n]/).filter((s) => s.trim()).length === 0}
-            style={{ padding: 8, background: "#007aff", color: "#fff", border: "none", borderRadius: 6 }}
+            disabled={!botToken.trim() || saving || currentChannelIds(channels).length === 0}
+            style={{ padding: 8, background: "#007aff", color: "#fff", border: "none", borderRadius: 6, marginBottom: 8 }}
           >
             {saving ? "Saving…" : connected ? "Update Slack connection" : "Connect Slack"}
           </button>
@@ -304,6 +312,11 @@ function DisconnectButton(
 }
 
 // --- shared bits ----------------------------------------------------------------
+
+/** Parse the channel-ID field into a clean list (comma/newline separated). */
+function currentChannelIds(channels: string): string[] {
+  return channels.split(/[,\n]/).map((s) => s.trim()).filter(Boolean);
+}
 
 interface SyncState {
   jobId: string;

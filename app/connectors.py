@@ -102,6 +102,17 @@ def _decrypt(ciphertext: str) -> dict:
     return json.loads(plaintext)
 
 
+def encrypt_secret_string(value: str) -> str:
+    """Seal a single durable secret string (e.g. an OAuth PKCE code_verifier
+    in a pending-approval row) with the same at-rest machinery as connector
+    credentials. Plaintext lives in memory only."""
+    return _encrypt({"v": value})
+
+
+def decrypt_secret_string(ciphertext: str) -> str:
+    return _decrypt(ciphertext)["v"]
+
+
 def _validate(source: str, config: dict) -> None:
     if source not in SOURCES:
         raise ValueError(f"Unknown connector source: {source!r} (expected one of {SOURCES})")

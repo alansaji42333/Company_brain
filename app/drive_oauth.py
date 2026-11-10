@@ -5,44 +5,52 @@ configured via GOOGLE_OAUTH_CLIENT_ID / _CLIENT_SECRET / _REDIRECT_URI. An
 org admin starts the flow in the UI:
 
   GET /api/v1/orgs/{org_id}/connectors/drive/oauth/start?folder_id=...
-    → 302 to Google's consent screen (access_type=offline, prompt=consent so
-      a refresh_token is always issued for the org).
+    → 200 {"authorize_url"} + an HttpOnly browser-binding cookie
 
-Google redirects the browser to the callback — no Authorization header can
-arrive there, so the HMAC-signed `state` (JWT, 10-minute expiry) is the
-authorization:
+Google redirects the browser to the org-less callback — no Authorization
+header can arrive there, so the SERVER-SIDE PENDING ROW is the authority
+(see DriveOAuthPending in app/database.py):
 
-  GET /api/v1/orgs/{org_id}/connectors/drive/oauth/callback?code&state
-    → exchanges the code, stores the encrypted per-org connector, audits it,
-      and 302s back to the frontend's connectors page.
+  GET /api/v1/connectors/drive/oauth/callback?code&state
+    → looks up the pending row by the `state` NONCE (Google echoes it back),
+      binds the returning browser via a hashed HttpOnly cookie,
+      atomically consumes the row (single-use, replay-proof), revalidates
+      the initiating user is STILL an org admin in the DB, exchanges the
+      code with the row's decrypted PKCE code_verifier, stores the encrypted
+      per-org connector, audits it, and 302s back to the frontend.
+
+The opaque `state` string alone never authorizes anything — a signature or
+guessable value is not enough: the row lookup + browser cookie + single-use
+consume + DB role revalidation are all required.
 
 The installed-app credentials.json flow (google_auth.py) is untouched; the
 web client dict stored in the connector config is exactly the shape the
 existing headless per-org Drive path consumes.
 """
+import hashlib
 import json
 import logging
+import secrets
 from urllib.parse import urlencode
-
-from jose import jwt as jose_jwt
-from jose.exceptions import ExpiredSignatureError as _JoseExpiredSignature
-from jose.exceptions import JWTError as _JoseJWTError
 
 logger = logging.getLogger(__name__)
 
-# State token lifetime (seconds) — the admin must complete Google consent
-# within this window.
+# The admin must complete Google consent within this window; the pending row
+# and the browser-binding cookie use the same lifetime.
 STATE_TTL_SECONDS = 600
 
+# One active OAuth flow per browser: starting a new flow OVERWRITES the
+# browser-binding cookie, deliberately abandoning older in-progress flows
+# in that browser (their callbacks fail the cookie check). Nothing is
+# kept in sync server-side — abandoned rows simply expire and are lazily
+# deleted by the callback path.
 STATE_PURPOSE = "drive_oauth"
 
 
 class OAuthStateError(ValueError):
-    """Raised when an OAuth callback's signed state cannot be trusted.
-
-    `reason` is a short, safe code for frontend redirects — it never contains
-    the raw token, exception text, or config values.
-    """
+    """Raised when an OAuth callback cannot be attributed to a legitimate
+    pending flow. `reason` is a short, safe code for frontend redirects — it
+    never contains the raw token, cookie, exception text, or config values."""
 
     def __init__(self, reason: str):
         super().__init__(reason)
@@ -61,9 +69,49 @@ def oauth_configured() -> bool:
     )
 
 
-def build_authorize_url(state: str) -> str:
+def _sha256(value: str) -> str:
+    """Hex sha256 — used for the state nonce and the browser secret. The raw
+    high-entropy values are never stored server-side."""
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def new_nonce() -> str:
+    """The opaque `state` value sent to Google: a high-entropy random token.
+    Only its sha256 is persisted (lookup key); it is single-use via the
+    pending row's consume."""
+    return secrets.token_urlsafe(32)
+
+
+def new_browser_secret() -> str:
+    """A separate high-entropy secret, delivered to the initiating browser as
+    an HttpOnly cookie scoped to the callback route. Its sha256 is persisted;
+    the callback constant-time-compares the cookie against that hash."""
+    return secrets.token_urlsafe(32)
+
+
+def verify_browser_secret(cookie_value: str, stored_hash: str) -> bool:
+    """Constant-time comparison of the cookie against the stored hash."""
+    return secrets.compare_digest(_sha256(cookie_value), stored_hash)
+
+
+def new_code_verifier() -> str:
+    """PKCE code_verifier (RFC 7636): 43-128 chars from the unreserved set.
+    Stored ENCRYPTED (connector-secret facilities); the S256 challenge goes
+    on the authorize URL."""
+    return secrets.token_urlsafe(48)  # ~64 chars, URL-safe alphabet
+
+
+def code_challenge_s256(code_verifier: str) -> str:
+    """RFC 7636 S256: BASE64URL(SHA256(ASCII(verifier))) without padding."""
+    digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+    import base64
+
+    return base64.urlsafe_b64encode(digest).decode().rstrip("=")
+
+
+def build_authorize_url(nonce: str, code_challenge: str) -> str:
     """Google's authorization endpoint with offline access (refresh_token
-    forced via prompt=consent) and the configured redirect URI."""
+    forced via prompt=consent), the configured redirect URI, and PKCE S256."""
     from app import config
 
     params = {
@@ -73,71 +121,28 @@ def build_authorize_url(state: str) -> str:
         "scope": " ".join(config.SCOPES),
         "access_type": "offline",
         "prompt": "consent",
-        "state": state,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+        "state": nonce,
     }
     return f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}"
 
 
-def make_state(org_id: str, user_id: str, folder_id: str) -> str:
-    """Sign the callback authorization: org_id + user_id + folder_id, 10-min
-    expiry, HS256 with JWT_SECRET. Refuses to start without a signing secret."""
-    from datetime import datetime, timedelta, timezone
-
-    from app import config
-
-    if not config.JWT_SECRET:
-        raise RuntimeError(
-            "Drive OAuth onboarding requires a signing secret: set JWT_SECRET"
-        )
-    now = datetime.now(timezone.utc)
-    return jose_jwt.encode(
-        {
-            "purpose": STATE_PURPOSE,
-            "org_id": org_id,
-            "user_id": user_id,
-            "folder_id": folder_id,
-            "iat": int(now.timestamp()),
-            "exp": int((now + timedelta(seconds=STATE_TTL_SECONDS)).timestamp()),
-        },
-        config.JWT_SECRET,
-        algorithm="HS256",
-    )
-
-
-def verify_state(token: str, path_org_id: str) -> dict:
-    """Verify signature, expiry, purpose, and that the callback's path org
-    matches the signed org. Returns the claims or raises OAuthStateError."""
-    from app import config
-
-    try:
-        claims = jose_jwt.decode(
-            token,
-            config.JWT_SECRET,
-            algorithms=["HS256"],
-            options={"require": ["exp", "purpose", "org_id", "user_id", "folder_id"]},
-        )
-    except _JoseExpiredSignature:
-        raise OAuthStateError("expired_state") from None
-    except _JoseJWTError:
-        raise OAuthStateError("invalid_state") from None
-
-    if claims.get("purpose") != STATE_PURPOSE:
-        raise OAuthStateError("invalid_state")
-    if claims.get("org_id") != path_org_id:
-        raise OAuthStateError("org_mismatch")
-    return claims
-
-
-def exchange_code(code: str, credentials_web_dict: dict) -> dict:
-    """Exchange an authorization code with Google. Returns `creds.to_json()`
-    (dict). Kept as a module function so tests can fake the network."""
+def exchange_code(code: str, credentials_web_dict: dict, code_verifier: str) -> dict:
+    """Exchange an authorization code with Google, proving the client holds
+    the PKCE verifier (PKCE works with google-auth-oauthlib 1.2.1's Flow:
+    it forwards code_verifier to the token endpoint on fetch_token).
+    Returns `creds.to_json()` (dict). Kept as a module function so tests can
+    fake the network."""
     from google_auth_oauthlib.flow import Flow
 
     from app import config
 
     flow = Flow.from_client_config(
-        {"web": credentials_web_dict}, scopes=config.SCOPES,
+        {"web": credentials_web_dict},
+        scopes=config.SCOPES,
         redirect_uri=config.GOOGLE_OAUTH_REDIRECT_URI,
+        code_verifier=code_verifier,
     )
     flow.fetch_token(code=code)
     creds = flow.credentials

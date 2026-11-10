@@ -5,6 +5,7 @@ caller's (user_id, org_id, role) by verifying a real membership, and every
 query filters on that org_id. Role gates are applied with `require_role`.
 """
 import logging
+import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
@@ -479,11 +480,20 @@ async def put_drive_connector(
 
 # --- Drive OAuth self-serve onboarding --------------------------------------
 # The browser flow for org admins: start → Google consent → callback.
-# The signed state JWT IS the callback's authorization (Google's redirect
-# carries no Authorization header). app/drive_oauth.py holds the crypto and
-# the code exchange; app/connectors.py the encrypted storage.
+# The callback is ORG-LESS (one deployment-level GOOGLE_OAUTH_REDIRECT_URI
+# can then serve every org) and carries no Authorization header — the
+# SERVER-SIDE pending row (DriveOAuthPending) is the authority: browser-
+# binding cookie + single-use atomic consume + DB role revalidation at
+# callback time. app/drive_oauth.py holds the crypto and the token exchange;
+# app/connectors.py the encrypted storage.
 
 _CONNECTORS_PAGE = "/connectors"  # frontend route where the UI shows result
+
+# The browser-binding cookie lives ONLY on the callback route: Google's
+# top-level redirect back carries it (SameSite=Lax) and no other request
+# can ever see it.
+_DRIVE_COOKIE_PATH = "/api/v1/connectors/drive/oauth/callback"
+_DRIVE_COOKIE_NAME = "drive_oauth_browser"
 
 
 def _drive_oauth_unavailable_error() -> HTTPException:
@@ -504,12 +514,19 @@ async def start_drive_oauth(
     folder_id: str | None = None,
     ctx: AuthContext = Depends(require_admin),
 ):
-    """Begin the Drive OAuth flow: 302 the admin's browser to Google.
+    """Begin the Drive OAuth flow. Returns JSON: {"authorize_url"} plus an
+    HttpOnly browser-binding cookie scoped to the callback route.
 
-    Same admin + membership checks as the manual PUT endpoint. `folder_id`
-    becomes part of the signed state and ends up in the stored connector.
+    The UI calls this through the authenticated api client (it sends the
+    Bearer token) and then navigates the browser to authorize_url. Same
+    admin + membership checks as the manual PUT endpoint; `folder_id` ends
+    up in the pending row and later in the stored connector.
     """
-    from app import drive_oauth
+    from fastapi.responses import JSONResponse
+    from sqlalchemy import delete as sa_delete
+
+    from app import connectors, drive_oauth
+    from app.database import DriveOAuthPending
 
     _require_member_of(ctx, org_id)
     org = await get_organization(db, org_id)
@@ -520,58 +537,143 @@ async def start_drive_oauth(
     if not folder_id or not folder_id.strip():
         raise HTTPException(status_code=400, detail="folder_id is required to configure the Drive connector")
 
-    from fastapi.responses import RedirectResponse
+    now = int(time.time())
+    expires_at = now + drive_oauth.STATE_TTL_SECONDS
+    nonce = drive_oauth.new_nonce()
+    browser_secret = drive_oauth.new_browser_secret()
+    code_verifier = drive_oauth.new_code_verifier()
 
-    try:
-        state = drive_oauth.make_state(org_id, ctx.user_id, folder_id.strip())
-    except RuntimeError as e:
-        # e.g. no signing secret — fail fast with a clear message, not a 500.
-        raise HTTPException(status_code=503, detail=str(e)) from None
+    # One active flow per BROWSER: starting a new flow OVERWRITES the cookie
+    # (older in-progress flows in this browser then fail the cookie check and
+    # are abandoned deliberately). Their rows simply expire and are picked up
+    # by the lazy expiry delete below.
+    db.add(
+        DriveOAuthPending(
+            nonce_hash=drive_oauth._sha256(nonce),
+            org_id=org_id,
+            user_id=ctx.user_id,
+            folder_id=folder_id.strip(),
+            browser_secret_hash=drive_oauth._sha256(browser_secret),
+            code_verifier_encrypted=connectors.encrypt_secret_string(code_verifier),
+            created_at=now,
+            expires_at=expires_at,
+            consumed_at=None,
+        )
+    )
+    # Lazy table hygiene: drop already-expired rows (never the one above —
+    # its expires_at is in the future).
+    await db.execute(sa_delete(DriveOAuthPending).where(DriveOAuthPending.expires_at < now))
+    await db.commit()
+
+    authorize_url = drive_oauth.build_authorize_url(nonce, drive_oauth.code_challenge_s256(code_verifier))
+    response = JSONResponse({"authorize_url": authorize_url})
+    response.set_cookie(
+        key=_DRIVE_COOKIE_NAME,
+        value=browser_secret,
+        max_age=drive_oauth.STATE_TTL_SECONDS,
+        path=_DRIVE_COOKIE_PATH,
+        secure=request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https",
+        httponly=True,
+        samesite="lax",  # Google's top-level redirect back must carry it
+    )
     logger.info("Drive OAuth started for org %s user %s", org_id, ctx.user_id)
-    return RedirectResponse(drive_oauth.build_authorize_url(state), status_code=302)
+    return response
 
 
-@router.get("/orgs/{org_id}/connectors/drive/oauth/callback")
+@router.get("/connectors/drive/oauth/callback")
 async def drive_oauth_callback(
-    org_id: str,
     request: Request,
     db: AsyncSession = Depends(get_db),
     code: str | None = None,
     state: str | None = None,
 ):
-    """Finish the Drive OAuth flow: exchange the code, store the connector,
-    audit it, and 302 back to the frontend's connectors page.
+    """Finish the Drive OAuth flow (org-less route — the org comes ONLY from
+    the consumed pending row, never from the URL).
 
-    No Authorization header exists on this route by design — the verified
-    signed state (org_user folder expiry) is the authorization.
+    No Authorization header exists here (Google's redirect) — authorization
+    is the server-side pending row bound to this browser:
+      1. row lookup by the state nonce (+ expiry), unknown/expired rejected;
+      2. browser-binding cookie checked (constant-time) BEFORE any consume
+         or token exchange;
+      3. single-use atomic consume (conditional UPDATE, zero rows = reject);
+      4. the initiating user must STILL be an org admin of the row's org;
+      5. code exchange with the row's decrypted PKCE verifier;
+      6. encrypted connector storage + audit, 302 back to the frontend with
+         only short safe reason codes.
+    The binding cookie is cleared on EVERY terminal outcome.
     """
     from fastapi.responses import RedirectResponse
+    from sqlalchemy import select
+    from sqlalchemy import update as sa_update
 
-    from app import audit, connectors, drive_oauth
+    from app import audit, connectors, drive_oauth, orgs
     from app.config import FRONTEND_URL
+    from app.database import DriveOAuthPending
 
     if not drive_oauth.oauth_configured():
         raise _drive_oauth_unavailable_error()
 
+    def _redirect(url: str) -> RedirectResponse:
+        response = RedirectResponse(url, status_code=302)
+        response.delete_cookie(_DRIVE_COOKIE_NAME, path=_DRIVE_COOKIE_PATH)
+        return response
+
     def _fail(reason: str) -> RedirectResponse:
-        return RedirectResponse(
-            f"{FRONTEND_URL}{_CONNECTORS_PAGE}?drive=error&reason={reason}", status_code=302
-        )
+        return _redirect(f"{FRONTEND_URL}{_CONNECTORS_PAGE}?drive=error&reason={reason}")
 
     if not code or not state:
         return _fail("missing_params")
 
-    try:
-        claims = drive_oauth.verify_state(state, org_id)
-    except drive_oauth.OAuthStateError as e:
-        logger.warning("Drive OAuth state rejected (%s)", e.reason)
-        return _fail(e.reason)
+    now = int(time.time())
+    row = await db.scalar(select(DriveOAuthPending).where(DriveOAuthPending.nonce_hash == drive_oauth._sha256(state)))
+    if row is None or row.expires_at < now:
+        # Lazy hygiene: drop the expired row if we found one. No exchange,
+        # nothing stored, no cookie check needed (row is not trustworthy).
+        if row is not None:
+            await db.delete(row)
+            await db.commit()
+        return _fail("unknown_state" if row is None else "expired_state")
+
+    # Initiator-browser binding FIRST (before consume/exchange): the cookie
+    # must carry the browser secret issued at start. Constant-time compare.
+    cookie_value = request.cookies.get(_DRIVE_COOKIE_NAME)
+    if not cookie_value or not drive_oauth.verify_browser_secret(cookie_value, row.browser_secret_hash):
+        logger.warning("Drive OAuth browser check failed for org %s (reason=browser_mismatch)", row.org_id)
+        return _fail("browser_mismatch")
+
+    # Single-use consume: ONE conditional UPDATE that only fires on a fresh
+    # (unconsumed, unexpired) row; zero rows affected = already consumed
+    # (replay) or expired. ATOMIC against concurrent callbacks: only one of
+    # them flips consumed_at, the other sees zero rows. Committed
+    # immediately — even a later exchange failure cannot resurrect the flow.
+    consume_result = await db.execute(
+        sa_update(DriveOAuthPending)
+        .where(
+            DriveOAuthPending.id == row.id,
+            DriveOAuthPending.consumed_at.is_(None),
+            DriveOAuthPending.expires_at >= now,
+        )
+        .values(consumed_at=now)
+    )
+    if consume_result.rowcount == 0:
+        return _fail("consumed_state")
+    await db.commit()
+
+    # Authorization revalidated AT CALLBACK TIME from the DB: the initiating
+    # user must still be an org admin of the row's org.
+    membership = await orgs.get_membership(db, row.org_id, row.user_id)
+    if membership is None or membership.role != orgs.ROLE_ADMIN:
+        logger.warning("Drive OAuth callback revoked: user %s no longer admin of org %s", row.user_id, row.org_id)
+        return _fail("revoked")
 
     try:
-        token_json = drive_oauth.exchange_code(code, drive_oauth.web_client_dict()["web"])
+        # PKCE: the encrypted verifier decrypts ONLY here (in memory).
+        code_verifier = connectors.decrypt_secret_string(row.code_verifier_encrypted)
+        token_json = drive_oauth.exchange_code(code, drive_oauth.web_client_dict()["web"], code_verifier)
     except Exception:
-        # Never log raw exception text (token URLs etc.); short safe reason.
-        logger.error("Drive OAuth code exchange failed for org %s", org_id)
+        # Never log raw exception text (token URLs, auth codes etc.) or the
+        # verifier — short safe reason only.
+        logger.error("Drive OAuth code exchange failed for org %s", row.org_id)
         return _fail("exchange_failed")
 
     if not token_json.get("refresh_token"):
@@ -580,22 +682,24 @@ async def drive_oauth_callback(
         return _fail("no_refresh_token")
 
     config = {
-        "folder_id": claims["folder_id"],
+        "folder_id": row.folder_id,
         "credentials_json": drive_oauth.web_client_dict()["web"],
         "token_json": token_json,
     }
     try:
-        await connectors.set_connector(db, org_id, "drive", config, claims["user_id"])
+        await connectors.set_connector(db, row.org_id, "drive", config, row.user_id)
     except ValueError as e:
-        logger.error("Drive OAuth callback rejected config for org %s: %s", org_id, e)
+        # Safe: config-shape rejection only; the message never contains the
+        # token material (see app.connectors._validate).
+        logger.error("Drive OAuth callback rejected config for org %s: %s", row.org_id, e)
         return _fail("invalid_config")
     await db.commit()
     await audit.record(
-        db, org_id, claims["user_id"], audit.ACTION_CONNECTOR_SET, payload={"source": "drive", "via": "oauth"}
+        db, row.org_id, row.user_id, audit.ACTION_CONNECTOR_SET, payload={"source": "drive", "via": "oauth"}
     )
     await db.commit()
-    logger.info("Drive connector stored via OAuth for org %s user %s", org_id, claims["user_id"])
-    return RedirectResponse(f"{FRONTEND_URL}{_CONNECTORS_PAGE}?drive=connected", status_code=302)
+    logger.info("Drive connector stored via OAuth for org %s user %s", row.org_id, row.user_id)
+    return _redirect(f"{FRONTEND_URL}{_CONNECTORS_PAGE}?drive=connected")
 
 
 @router.delete("/orgs/{org_id}/connectors/{source}")

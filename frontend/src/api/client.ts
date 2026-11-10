@@ -320,7 +320,13 @@ export const api = {
       `/orgs/${encodeURIComponent(orgId)}/connectors/${source}`,
       { method: "DELETE" },
     ),
-
+  // Drive OAuth (self-serve): authenticated start returns the Google
+  // authorize URL (the browser then navigates there) — this goes through the
+  // api client because the start endpoint needs the Bearer token.
+  startDriveOAuth: (orgId: string, folderId: string) =>
+    request<{ authorize_url: string }>(
+      `/orgs/${encodeURIComponent(orgId)}/connectors/drive/oauth/start?folder_id=${encodeURIComponent(folderId)}`,
+    ),
   // Skills
   listSkills: () => request<{ skills: SkillSummary[] }>("/skills"),
   getSkill: (id: string) => request<SkillDetail>(`/skills/${id}`),

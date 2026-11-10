@@ -95,7 +95,10 @@ RATE_LIMIT: str = os.getenv("RATE_LIMIT", "30/minute")
 # installed-app credentials.json used by google_auth.py's headless path).
 GOOGLE_OAUTH_CLIENT_ID: str = os.getenv("GOOGLE_OAUTH_CLIENT_ID", "")
 GOOGLE_OAUTH_CLIENT_SECRET: str = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET", "")
-# Absolute callback URL, e.g. https://<host>/api/v1/orgs/some_org_id/connectors/drive/oauth/callback
+# Absolute ORG-LESS callback URL, e.g. https://<host>/api/v1/connectors/drive/oauth/callback
+# (one URL serves every org; the org comes from the server-side pending
+# transaction, never from the URL). Register EXACTLY this URL in the Google
+# OAuth client's Authorized redirect URIs.
 GOOGLE_OAUTH_REDIRECT_URI: str = os.getenv("GOOGLE_OAUTH_REDIRECT_URI", "")
 FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:5173")
 
@@ -147,7 +150,14 @@ def validate_config():
         # fails at startup instead of as a broken UI flow.
         if not FRONTEND_URL:
             raise RuntimeError("AUTH0_ENABLED is true but FRONTEND_URL is not set")
-        not_set = [name for name, value in zip(GOOGLE_OAUTH_REQUIRED, (GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET, GOOGLE_OAUTH_REDIRECT_URI)) if not value]
+        not_set = [
+            name
+            for name, value in zip(
+                GOOGLE_OAUTH_REQUIRED,
+                (GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET, GOOGLE_OAUTH_REDIRECT_URI),
+            )
+            if not value
+        ]
         if not_set:
             raise RuntimeError(f"AUTH0_ENABLED is true but {', '.join(not_set)} not set")
     elif not (GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET and GOOGLE_OAUTH_REDIRECT_URI):

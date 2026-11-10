@@ -2,7 +2,7 @@ import logging
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, Column, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import JSON, BigInteger, Column, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, relationship
 
@@ -114,6 +114,40 @@ class OrgConnectorConfig(Base):
     updated_by = Column(String, nullable=False)
     updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc),
                         onupdate=lambda: datetime.now(timezone.utc), nullable=False)
+
+
+class DriveOAuthPending(Base):
+    """One in-progress Drive OAuth transaction, created by the start endpoint.
+
+    This row — not the opaque `state` string — is the authority for the
+    callback: it binds the flow to (org, initiating user, folder), to the
+    INITIATING BROWSER (hash of a high-entropy browser secret delivered as an
+    HttpOnly callback-scoped cookie), and carries the PKCE code_verifier
+    ENCRYPTED at rest (same Fernet facilities as connector secrets).
+
+    - nonce_hash: sha256 of the random `state` nonce Google echoes back. The
+      raw nonce is never stored.
+    - browser_secret_hash: sha256 of the browser secret; compared
+      constant-time at callback time BEFORE consuming or exchanging.
+    - code_verifier_encrypted: Fernet ciphertext (secrets machinery in
+      app.connectors), decrypted only to perform the token exchange.
+    - created_at / expires_at / consumed_at: epoch-integer seconds. `expires_at`
+      is ~10 minutes after creation; `consumed_at` stays NULL until the single
+      atomic consume UPDATE flips it (replay protection). Rows are lazily
+      deleted once expired.
+    """
+    __tablename__ = "drive_oauth_pendings"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    nonce_hash = Column(String(64), nullable=False, index=True)
+    org_id = Column(String, ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(String, nullable=False)
+    folder_id = Column(String, nullable=False)
+    browser_secret_hash = Column(String(64), nullable=False)
+    code_verifier_encrypted = Column(Text, nullable=False)
+    created_at = Column(BigInteger, nullable=False)
+    expires_at = Column(BigInteger, nullable=False)
+    consumed_at = Column(BigInteger, nullable=True)
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:

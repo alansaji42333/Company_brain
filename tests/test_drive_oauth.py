@@ -1,11 +1,17 @@
-"""Drive OAuth self-serve onboarding: start + callback endpoints.
+"""Drive OAuth self-serve onboarding: pending-row flow (start + callback).
 
 Hermetic — no Google/HTTP network: the token exchange is faked at the
-`drive_oauth.exchange_code` boundary. Covers: state round-trip, tampered /
-expired / org-mismatched state, successful callback stores an encrypted
-connector row + audits + redirects, missing refresh_token saves nothing,
-and start-endpoint authorization (admin-only, member-of, configuration
-checks).
+`drive_oauth.exchange_code` boundary. The server-side pending row is the
+authority; the opaque state is only a lookup nonce.
+
+Covers:
+- start: 200 {"authorize_url"} with PKCE S256 challenge; HttpOnly browser-
+  binding cookie scoped to the callback path; admin/membership/fault gates;
+  a second start overwrites the cookie (abandoning the older flow).
+- callback: browser cookie checked BEFORE any consume/exchange; single-use
+  atomic consume (replay → consumed_state); DB role revalidation (revoked
+  admins rejected); encrypted connector storage audited to the ROW's user;
+  cookie cleared on every terminal outcome; only short safe reason codes.
 """
 import asyncio
 
@@ -16,6 +22,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 FRONTEND = "https://frontend.example"
 CONNECTORS_PAGE = f"{FRONTEND}/connectors"
+CALLBACK_PATH = "/api/v1/connectors/drive/oauth/callback"
+COOKIE_NAME = "drive_oauth_browser"
 
 
 @pytest_asyncio.fixture
@@ -30,7 +38,7 @@ async def oauth_env(monkeypatch, tmp_path):
     monkeypatch.setattr(auth, "AUTH0_ENABLED", False)
     monkeypatch.setattr(config, "GOOGLE_OAUTH_CLIENT_ID", "oauth-client-id")
     monkeypatch.setattr(config, "GOOGLE_OAUTH_CLIENT_SECRET", "oauth-client-secret")
-    monkeypatch.setattr(config, "GOOGLE_OAUTH_REDIRECT_URI", "https://backend.example/api/v1/orgs/{}/connectors/drive/oauth/callback")
+    monkeypatch.setattr(config, "GOOGLE_OAUTH_REDIRECT_URI", "https://backend.example" + CALLBACK_PATH)
     monkeypatch.setattr(config, "FRONTEND_URL", FRONTEND)
 
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'oauth.db'}")
@@ -72,8 +80,31 @@ async def _seed_org(session_factory, owner: str, extra_member: str | None = None
         return org["id"]
 
 
+def _start(client, org: str, folder_id: str = "F-123", user: str = "admin1"):
+    """Start the flow as the admin; returns the response."""
+    return client.get(
+        f"/api/v1/orgs/{org}/connectors/drive/oauth/start",
+        params={"folder_id": folder_id},
+        headers={"Authorization": f"Bearer {_token(user, org)}"},
+        follow_redirects=False,
+    )
+
+
+def _state_of(authorize_url: str) -> str:
+    from urllib.parse import parse_qs, urlparse
+
+    return parse_qs(urlparse(authorize_url).query)["state"][0]
+
+
+async def _pending_rows(session_factory):
+    from app.database import DriveOAuthPending
+
+    async with session_factory() as db:
+        return list((await db.execute(select(DriveOAuthPending))).scalars().all())
+
+
 class _FakeCreds:
-    """Mimics google Credentials.to_json() (a JSON string) post-parse."""
+    """Mimics the token dict that `exchange_code` returns."""
 
     def __init__(self, with_refresh=True):
         self._dict = {
@@ -92,10 +123,11 @@ def exchange_spy(monkeypatch):
     """Fakes the Google token exchange, recording calls."""
     from app import drive_oauth
 
-    calls = {"codes": [], "result": None, "raise": None}
+    calls = {"codes": [], "verifiers": [], "result": None, "raise": None}
 
-    def fake_exchange(code: str, credentials_web_dict: dict) -> dict:
+    def fake_exchange(code: str, credentials_web_dict: dict, code_verifier: str) -> dict:
         calls["codes"].append(code)
+        calls["verifiers"].append(code_verifier)
         if calls["raise"]:
             raise calls["raise"]
         assert credentials_web_dict.get("client_id") == "oauth-client-id"
@@ -107,51 +139,96 @@ def exchange_spy(monkeypatch):
 
 # --- start endpoint -----------------------------------------------------------
 
-def test_start_redirects_to_google_consent(oauth_env):
+def test_start_200_json_with_pkce_challenge_and_browser_cookie(oauth_env):
+    client, session_factory = oauth_env
+    org = asyncio.run(_seed_org(session_factory, "admin1"))
+    res = _start(client, org)
+    assert res.status_code == 200, res.text
+    url = res.json()["authorize_url"]
+    assert url.startswith("https://accounts.google.com/o/oauth2/v2/auth?")
+    from urllib.parse import parse_qs, urlparse
+
+    q = parse_qs(urlparse(url).query)
+    assert q["response_type"] == ["code"]
+    assert q["client_id"] == ["oauth-client-id"]
+    assert q["access_type"] == ["offline"]
+    assert q["prompt"] == ["consent"]  # refresh_token is mandatory
+    # PKCE S256 on the authorize URL
+    assert q["code_challenge_method"] == ["S256"]
+    assert len(q["code_challenge"][0]) == 43
+    assert "state" in q
+
+    # Browser-binding cookie: HttpOnly, SameSite=Lax, callback-scoped Path,
+    # short Max-Age; no Secure flag on a plain-HTTP test request.
+    cookies = res.headers.get_list("set-cookie")
+    assert len(cookies) == 1
+    (cookie,) = [c for c in cookies if c.startswith(COOKIE_NAME + "=")]
+    assert "HttpOnly" in cookie
+    assert "SameSite=lax" in cookie
+    assert f"Path={CALLBACK_PATH}" in cookie
+    assert "Max-Age=600" in cookie
+    assert "secure" not in cookie.lower()  # plain-HTTP test request ⇒ no Secure flag
+
+
+async def _connectors_rows(session_factory, org: str):
+    from app.database import OrgConnectorConfig
+
+    async with session_factory() as db:
+        rows = (await db.execute(select(OrgConnectorConfig))).scalars().all()
+        return [r for r in rows if r.org_id == org]
+
+
+def test_start_creates_pending_row_with_encrypted_verifier(oauth_env):
+    client, session_factory = oauth_env
+    org = asyncio.run(_seed_org(session_factory, "admin1"))
+    res = _start(client, org)
+    assert res.status_code == 200
+
+    from app import connectors, drive_oauth
+
+    rows = asyncio.run(_pending_rows(session_factory))
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.org_id == org and row.user_id == "admin1" and row.folder_id == "F-123"
+    assert row.consumed_at is None
+    # nonce hash matches the state echoed on the URL; raw nonce not stored
+    nonce = _state_of(res.json()["authorize_url"])
+    assert drive_oauth._sha256(nonce) == row.nonce_hash
+    assert nonce not in row.nonce_hash
+    # PKCE verifier encrypted at rest (Fernet ciphertext), decryptable
+    assert row.code_verifier_encrypted.startswith("gAAA")
+    assert connectors.decrypt_secret_string(row.code_verifier_encrypted)
+    # browser secret hash only — the cookie we got is the raw secret
+    cookie = res.headers.get_list("set-cookie")[0].split("=", 1)[1].split(";")[0]
+    assert drive_oauth._sha256(cookie) == row.browser_secret_hash
+
+
+def test_start_401_without_token(oauth_env):
     client, session_factory = oauth_env
     org = asyncio.run(_seed_org(session_factory, "admin1"))
     res = client.get(
         f"/api/v1/orgs/{org}/connectors/drive/oauth/start",
         params={"folder_id": "F-123"},
-        headers={"Authorization": f"Bearer {_token('admin1', org)}"},
         follow_redirects=False,
     )
-    assert res.status_code == 302, res.text
-    location = res.headers["location"]
-    assert location.startswith("https://accounts.google.com/o/oauth2/v2/auth?")
-    for fragment in (
-        "response_type=code",
-        "client_id=oauth-client-id",
-        "access_type=offline",
-        "prompt=consent",  # refresh_token is mandatory
-    ):
-        assert fragment in location, location
-    # The state travels with the redirect and round-trips against the path org.
-    state = next(p.split("=", 1)[1] for p in location.split("&") if p.startswith("state="))
-    from app import drive_oauth
-    claims = drive_oauth.verify_state(state, org)
-    assert claims["user_id"] == "admin1" and claims["folder_id"] == "F-123"
+    assert res.status_code == 401
 
 
 def test_start_requires_admin_role(oauth_env):
     client, session_factory = oauth_env
     org = asyncio.run(_seed_org(session_factory, "admin1", extra_member="peon", extra_role="member"))
-    res = client.get(
-        f"/api/v1/orgs/{org}/connectors/drive/oauth/start",
-        params={"folder_id": "F-123"},
-        headers={"Authorization": f"Bearer {_token('peon', org)}"},
-        follow_redirects=False,
-    )
+    res = _start(client, org, user="peon")
     assert res.status_code == 403
 
 
 def test_start_requires_membership(oauth_env):
     client, session_factory = oauth_env
     org = asyncio.run(_seed_org(session_factory, "admin1"))
+    headers = {"Authorization": f"Bearer {_token('boss_of_other_org', 'org_other_member')}"}
     res = client.get(
         f"/api/v1/orgs/{org}/connectors/drive/oauth/start",
         params={"folder_id": "F-123"},
-        headers={"Authorization": f"Bearer {_token('boss_of_other_org', 'org_other_member')}"},
+        headers=headers,
         follow_redirects=False,
     )
     assert res.status_code == 403
@@ -174,73 +251,80 @@ def test_start_503_when_oauth_unconfigured(oauth_env, monkeypatch):
     client, session_factory = oauth_env
     org = asyncio.run(_seed_org(session_factory, "admin1"))
     monkeypatch.setattr(config, "GOOGLE_OAUTH_CLIENT_ID", "")
-    res = client.get(
-        f"/api/v1/orgs/{org}/connectors/drive/oauth/start",
-        params={"folder_id": "F-123"},
-        headers={"Authorization": f"Bearer {_token('admin1', org)}"},
-        follow_redirects=False,
-    )
+    res = _start(client, org)
     assert res.status_code == 503
     assert "GOOGLE_OAUTH_CLIENT_ID" in res.json()["detail"]
 
 
-def test_start_503_when_no_signing_secret(oauth_env, monkeypatch):
-    from app import config
-
+def test_second_start_overwrites_cookie_abandoning_first_flow(oauth_env):
+    """One active flow per browser: the second start replaces the cookie, so
+    the FIRST flow's callback now fails the cookie check (deliberate)."""
     client, session_factory = oauth_env
     org = asyncio.run(_seed_org(session_factory, "admin1"))
-    monkeypatch.setattr(config, "JWT_SECRET", "")
-    res = client.get(
-        f"/api/v1/orgs/{org}/connectors/drive/oauth/start",
-        params={"folder_id": "F-123"},
-        headers={"Authorization": f"Bearer {_token('admin1', org)}"},
-        follow_redirects=False,
-    )
-    assert res.status_code == 503
+    first = _start(client, org)
+    state1 = _state_of(first.json()["authorize_url"])
+    second = _start(client, org, folder_id="F-456")
+    assert second.status_code == 200
+    state2 = _state_of(second.json()["authorize_url"])
+    assert state1 != state2
+    assert len(asyncio.run(_pending_rows(session_factory))) == 2
+
+    from app import drive_oauth
+
+    # rows are separate; the replayed old flow is killed by the COOKIE check
+    # (server-side both rows technically exist until expiry lazy-delete).
+    row1 = next(r for r in asyncio.run(_pending_rows(session_factory)) if r.folder_id == "F-123")
+    row2 = next(r for r in asyncio.run(_pending_rows(session_factory)) if r.folder_id == "F-456")
+    assert row1.nonce_hash != row2.nonce_hash
+    assert drive_oauth._sha256(state2) == row2.nonce_hash
 
 
 # --- callback -----------------------------------------------------------------
 
-def _callback(client, org: str, state: str, code: str = "4/valid-auth-code", follow: bool = False):
-    """Call the callback unfollowed by default so the 302 target is asserted
-    directly."""
+def _callback(client, state: str, code: str = "4/valid-auth-code"):
     return client.get(
-        f"/api/v1/orgs/{org}/connectors/drive/oauth/callback",
+        CALLBACK_PATH,
         params={"code": code, "state": state},
-        follow_redirects=follow,
+        follow_redirects=False,
     )
 
 
-def _state_for(org: str, user_id: str = "admin1", folder_id: str = "F-123") -> str:
-    from app import drive_oauth
-    return drive_oauth.make_state(org, user_id, folder_id)
+def _cookie_of(res):
+    (cookie,) = [c for c in res.headers.get_list("set-cookie") if c.startswith(COOKIE_NAME + "=")]
+    return cookie
 
 
-async def _connector_rows(session_factory, org: str):
-    from app.database import OrgConnectorConfig
-
-    async with session_factory() as db:
-        rows = (await db.execute(select(OrgConnectorConfig))).scalars().all()
-        return [r for r in rows if r.org_id == org]
-
-
-def test_callback_success_stores_encrypted_row_and_redirects(oauth_env, exchange_spy):
+def test_callback_happy_path_consumes_once_stores_encrypted_audits_and_clears_cookie(
+    oauth_env, exchange_spy
+):
     client, session_factory = oauth_env
     org = asyncio.run(_seed_org(session_factory, "admin1"))
-    state = _state_for(org)
+    start = _start(client, org)
+    url = start.json()["authorize_url"]
+    state = _state_of(url)
+    cookie_raw = start.headers.get_list("set-cookie")[0]
 
-    res = _callback(client, org, state, follow=False)
+    res = _callback(client, state)
     assert res.status_code == 302
     assert res.headers["location"] == f"{CONNECTORS_PAGE}?drive=connected"
-    assert exchange_spy["codes"] == ["4/valid-auth-code"]
 
-    # The stored row decrypts to the exact config the consumer expects.
+    # exchange happened exactly once, with the pending row's verifier
+    assert exchange_spy["codes"] == ["4/valid-auth-code"]
+    assert len(exchange_spy["verifiers"]) == 1
+    assert 43 <= len(exchange_spy["verifiers"][0]) <= 128
+
+    # row is consumed exactly once
+    rows = asyncio.run(_pending_rows(session_factory))
+    assert len(rows) == 1 and rows[0].consumed_at is not None
+
+    # connector stored ENCRYPTED under the row's org, decryptable for ingest
     from app import connectors
 
-    rows = asyncio.run(_connector_rows(session_factory, org))
+    rows = asyncio.run(_connectors_rows(session_factory, org))
     assert len(rows) == 1
     ciphertext = rows[0].config_encrypted
-    assert "refresh_token" not in ciphertext  # sealed, no plaintext secrets
+    assert "refresh_token" not in ciphertext  # sealed — no plaintext secrets
+    assert "1//refresh" not in ciphertext
 
     async def _get():
         async with session_factory() as db:
@@ -251,97 +335,184 @@ def test_callback_success_stores_encrypted_row_and_redirects(oauth_env, exchange
     assert config["token_json"]["refresh_token"] == "1//refresh"
     assert config["credentials_json"]["client_id"] == "oauth-client-id"
 
-    # Audit: ACTION_CONNECTOR_SET attributed to the state's user (not whoever
-    # clicks), payload safe.
+    # audit attributed to the ROW's user
     from app import audit
     from app.database import AuditLog
 
-    async def _audit_rows():
-        async with session_factory() as db:
-            return (await db.execute(select(AuditLog))).scalars().all()
-
-    logs = asyncio.run(_audit_rows())
-    set_rows = [r for r in logs if r.action_type == audit.ACTION_CONNECTOR_SET]
-    assert len(set_rows) == 1
-    assert set_rows[0].user_id == "admin1"
-
-
-def test_callback_tampered_state_rejected(oauth_env, exchange_spy):
-    client, session_factory = oauth_env
-    org = asyncio.run(_seed_org(session_factory, "admin1"))
-
-    # A different org's valid state is still tamper evidence for THIS org.
-    other_org = asyncio.run(_seed_org(session_factory, "admin2"))
-    foreign_state = _state_for(other_org, user_id="admin2")
-    res = _callback(client, org, foreign_state, follow=False)
-    assert res.status_code == 302
-    assert res.headers["location"] == f"{CONNECTORS_PAGE}?drive=error&reason=org_mismatch"
-    assert exchange_spy["codes"] == [], "code must never be exchanged with untrusted state"
-    assert asyncio.run(_connector_rows(session_factory, org)) == []
-
-    # A literally corrupted state string.
-    corrupted = _state_for(org)[:-3] + "abc"
-    res = _callback(client, org, corrupted, follow=False)
-    assert "drive=error&reason=invalid_state" in res.headers["location"]
-    assert exchange_spy["codes"] == []
-
-
-def test_callback_expired_state_rejected(oauth_env, exchange_spy, monkeypatch):
-    from app import drive_oauth
-
-    client, session_factory = oauth_env
-    org = asyncio.run(_seed_org(session_factory, "admin1"))
-    monkeypatch.setattr(drive_oauth, "STATE_TTL_SECONDS", -1)  # already stale at issue time
-    state = _state_for(org)
-    monkeypatch.setattr(drive_oauth, "STATE_TTL_SECONDS", 600)
-
-    res = _callback(client, org, state, follow=False)
-    assert "drive=error&reason=expired_state" in res.headers["location"]
-    assert exchange_spy["codes"] == []
-    assert asyncio.run(_connector_rows(session_factory, org)) == []
-
-
-def test_callback_missing_refresh_token_saves_nothing(oauth_env, exchange_spy):
-    client, session_factory = oauth_env
-    org = asyncio.run(_seed_org(session_factory, "admin1"))
-    state = _state_for(org)
-    exchange_spy["result"] = _FakeCreds(with_refresh=False).to_dict()
-
-    res = _callback(client, org, state, follow=False)
-    assert res.status_code == 302
-    assert res.headers["location"] == f"{CONNECTORS_PAGE}?drive=error&reason=no_refresh_token"
-    # Nothing was written: without a refresh_token the connection would die
-    # at the first expiry — the admin must re-consent (prompt=consent forces
-    # Google to re-issue one).
-    assert asyncio.run(_connector_rows(session_factory, org)) == []
-    from app import audit
-    from app.database import AuditLog
-
-    async def _audit_rows():
+    async def _audits():
         async with session_factory() as db:
             return list((await db.execute(select(AuditLog))).scalars().all())
 
-    assert not [r for r in asyncio.run(_audit_rows()) if r.action_type == audit.ACTION_CONNECTOR_SET]
+    set_rows = [r for r in asyncio.run(_audits()) if r.action_type == audit.ACTION_CONNECTOR_SET]
+    assert len(set_rows) == 1 and set_rows[0].user_id == "admin1"
+
+    # binding cookie cleared on the terminal response
+    cleared = _cookie_of(res)
+    assert cookie_raw != cleared
+    assert f"{COOKIE_NAME}=" in cleared and "Max-Age=0" in cleared
 
 
-def test_callback_exchange_failure_redirects_error(oauth_env, exchange_spy):
+def test_callback_without_cookie_rejected_before_exchange(oauth_env, exchange_spy):
+    """Cross-browser/attacker callback: a fresh TestClient has NO cookie —
+    rejected before any consume or exchange (spy-verified)."""
     client, session_factory = oauth_env
     org = asyncio.run(_seed_org(session_factory, "admin1"))
-    exchange_spy["raise"] = RuntimeError("grant_invalid")
-    state = _state_for(org)
+    start = _start(client, org)
+    state = _state_of(start.json()["authorize_url"])
 
-    res = _callback(client, org, state, follow=False)
-    assert "drive=error&reason=exchange_failed" in res.headers["location"]
-    assert asyncio.run(_connector_rows(session_factory, org)) == []
+    from fastapi.testclient import TestClient
+
+    from app.server import app
+
+    other_browser = TestClient(app)
+    res = _callback(other_browser, state)
+    assert res.status_code == 302
+    assert res.headers["location"] == f"{CONNECTORS_PAGE}?drive=error&reason=browser_mismatch"
+    assert exchange_spy["codes"] == []  # never exchanged
+    assert asyncio.run(_connectors_rows(session_factory, org)) == []
+    assert all(r.consumed_at is None for r in asyncio.run(_pending_rows(session_factory)))
 
 
-def test_callback_requires_params(oauth_env, exchange_spy):
+def test_callback_with_wrong_cookie_rejected_before_exchange(oauth_env, exchange_spy):
     client, session_factory = oauth_env
     org = asyncio.run(_seed_org(session_factory, "admin1"))
-    res = client.get(
-        f"/api/v1/orgs/{org}/connectors/drive/oauth/callback",
-        follow_redirects=False,
-    )
+    start = _start(client, org)
+    state = _state_of(start.json()["authorize_url"])
+
+    # a DIFFERENT secret in the cookie (attacker forges any value). Delete the
+    # jar entry first (TestClient stores it under domain testserver.local),
+    # then set the forged value as the only cookie the server sees.
+    client.cookies.delete(COOKIE_NAME, domain="testserver.local", path=CALLBACK_PATH)
+    client.cookies.set(COOKIE_NAME, "forged-browser-secret", domain="testserver.local", path=CALLBACK_PATH)
+    res = _callback(client, state)
+    assert res.status_code == 302
+    assert "drive=error&reason=browser_mismatch" in res.headers["location"]
+    assert exchange_spy["codes"] == []
+    assert asyncio.run(_connectors_rows(session_factory, org)) == []
+
+
+def test_callback_replay_rejected_second_attempt(oauth_env, exchange_spy):
+    client, session_factory = oauth_env
+    org = asyncio.run(_seed_org(session_factory, "admin1"))
+    start = _start(client, org)
+    state = _state_of(start.json()["authorize_url"])
+    # keep the original browser secret: a browser that ignores the clear
+    # still cannot replay — the ROW is single-use.
+    cookie_value = start.headers.get_list("set-cookie")[0].split("=", 1)[1].split(";")[0]
+
+    first = _callback(client, state)
+    assert first.headers["location"].endswith("drive=connected")
+    assert exchange_spy["codes"] == ["4/valid-auth-code"]
+
+    # simulate a browser that kept the cookie across the clear (the first
+    # response's Max-Age=0 may already have purged it from the jar)
+    try:
+        client.cookies.delete(COOKIE_NAME, domain="testserver.local", path=CALLBACK_PATH)
+    except KeyError:
+        pass
+    client.cookies.set(COOKIE_NAME, cookie_value, domain="testserver.local", path=CALLBACK_PATH)
+    second = _callback(client, state)
+    assert "drive=error&reason=consumed_state" in second.headers["location"]
+    # no second exchange, no duplicate storage, no extra rows
+    assert exchange_spy["codes"] == ["4/valid-auth-code"]
+    assert len(asyncio.run(_connectors_rows(session_factory, org))) == 1
+    assert len(asyncio.run(_pending_rows(session_factory))) == 1
+
+
+def test_callback_unknown_state_rejected(oauth_env, exchange_spy):
+    client, session_factory = oauth_env
+    org = asyncio.run(_seed_org(session_factory, "admin1"))
+    _start(client, org)  # irrelevant row exists
+
+    res = _callback(client, "never-issued-nonce")
+    assert "drive=error&reason=unknown_state" in res.headers["location"]
+    assert exchange_spy["codes"] == []
+    assert asyncio.run(_connectors_rows(session_factory, org)) == []
+    # cookie cleared even on this error path (the browser may hold one)
+    assert "Max-Age=0" in _cookie_of(res)
+
+
+def test_callback_expired_state_rejected_and_row_deleted(oauth_env, exchange_spy):
+    client, session_factory = oauth_env
+    org = asyncio.run(_seed_org(session_factory, "admin1"))
+    start = _start(client, org)
+    state = _state_of(start.json()["authorize_url"])
+
+    async def _expire():
+        from app.database import DriveOAuthPending
+
+        async with session_factory() as db:
+            row = (await db.execute(select(DriveOAuthPending))).scalars().one()
+            row.expires_at = 1  # epoch second: long past
+            await db.commit()
+
+    asyncio.run(_expire())
+    res = _callback(client, state)
+    assert "drive=error&reason=expired_state" in res.headers["location"]
+    assert exchange_spy["codes"] == []
+    assert asyncio.run(_connectors_rows(session_factory, org)) == []
+    # lazy delete removed the expired row
+    assert asyncio.run(_pending_rows(session_factory)) == []
+
+
+def test_callback_role_revoked_between_start_and_callback(oauth_env, exchange_spy):
+    client, session_factory = oauth_env
+    # a second admin so demoting admin1 does not trip the last-admin guard
+    org = asyncio.run(_seed_org(session_factory, "admin1", extra_member="admin2", extra_role="admin"))
+    start = _start(client, org)
+    state = _state_of(start.json()["authorize_url"])
+
+    async def _demote():
+        from app import orgs
+
+        async with session_factory() as db:
+            await orgs.set_member_role(db, org, "admin1", "member", actor_user_id="admin2")
+            await db.commit()
+
+    asyncio.run(_demote())
+    res = _callback(client, state)
+    assert "drive=error&reason=revoked" in res.headers["location"]
+    assert exchange_spy["codes"] == []
+    assert asyncio.run(_connectors_rows(session_factory, org)) == []
+
+
+def test_callback_exchange_failure_redirects_error_and_clears_cookie(oauth_env, exchange_spy):
+    client, session_factory = oauth_env
+    org = asyncio.run(_seed_org(session_factory, "admin1"))
+    start = _start(client, org)
+    state = _state_of(start.json()["authorize_url"])
+    exchange_spy["raise"] = RuntimeError("grant_invalid with sensitive token userinfo")
+
+    res = _callback(client, state)
+    assert res.status_code == 302
+    assert res.headers["location"] == f"{CONNECTORS_PAGE}?drive=error&reason=exchange_failed"
+    # no raw exception text in the redirect
+    assert "grant_invalid" not in res.headers["location"]
+    assert asyncio.run(_connectors_rows(session_factory, org)) == []
+    assert "Max-Age=0" in _cookie_of(res)
+    # flow burned even though the exchange failed (single-use durability)
+    rows = asyncio.run(_pending_rows(session_factory))
+    assert rows[0].consumed_at is not None
+
+
+def test_callback_no_refresh_token_saves_nothing(oauth_env, exchange_spy):
+    client, session_factory = oauth_env
+    org = asyncio.run(_seed_org(session_factory, "admin1"))
+    start = _start(client, org)
+    state = _state_of(start.json()["authorize_url"])
+    exchange_spy["result"] = _FakeCreds(with_refresh=False).to_dict()
+
+    res = _callback(client, state)
+    assert res.status_code == 302
+    assert res.headers["location"] == f"{CONNECTORS_PAGE}?drive=error&reason=no_refresh_token"
+    assert asyncio.run(_connectors_rows(session_factory, org)) == []
+    assert "Max-Age=0" in _cookie_of(res)
+
+
+def test_callback_missing_params(oauth_env, exchange_spy):
+    client, session_factory = oauth_env
+    asyncio.run(_seed_org(session_factory, "admin1"))
+    res = client.get(CALLBACK_PATH, follow_redirects=False)
     assert res.status_code == 302
     assert "drive=error&reason=missing_params" in res.headers["location"]
 
@@ -351,35 +522,34 @@ def test_callback_still_503_when_oauth_unconfigured(oauth_env, exchange_spy, mon
 
     client, session_factory = oauth_env
     org = asyncio.run(_seed_org(session_factory, "admin1"))
+    start = _start(client, org)
+    state = _state_of(start.json()["authorize_url"])
     monkeypatch.setattr(config, "GOOGLE_OAUTH_REDIRECT_URI", "")
-    res = _callback(client, org, _state_for(org), follow=False)
+    res = _callback(client, state)
     assert res.status_code == 503
 
 
-# --- state unit contract --------------------------------------------------------
+# --- drive_oauth unit contract ---------------------------------------------------
 
-def test_state_roundtrip_and_mismatch():
+def test_browser_secret_and_nonce_are_high_entropy_and_constant_time():
     from app import drive_oauth
 
-    state = _state_for("org_aaa", user_id="u1", folder_id="F1")
-    claims = drive_oauth.verify_state(state, "org_aaa")
-    assert claims == {
-        "purpose": "drive_oauth",
-        "org_id": "org_aaa",
-        "user_id": "u1",
-        "folder_id": "F1",
-        "iat": claims["iat"],
-        "exp": claims["exp"],
-    }
-    assert claims["exp"] - claims["iat"] == drive_oauth.STATE_TTL_SECONDS
-
-    with pytest.raises(drive_oauth.OAuthStateError, match="org_mismatch"):
-        drive_oauth.verify_state(state, "org_bbb")
+    n1, n2 = drive_oauth.new_nonce(), drive_oauth.new_nonce()
+    s1, s2 = drive_oauth.new_browser_secret(), drive_oauth.new_browser_secret()
+    assert len(n1) == len(n2) and len(s1) == len(s2) and n1 != n2 and s1 != s2
+    assert drive_oauth._sha256(n1) == drive_oauth._sha256(n1)
+    assert drive_oauth.verify_browser_secret(s1, drive_oauth._sha256(s1))
+    assert not drive_oauth.verify_browser_secret(s2, drive_oauth._sha256(s1))
 
 
-def test_state_refuses_without_signing_secret(monkeypatch):
-    from app import config, drive_oauth
+def test_pkce_verifier_and_challenge_contract():
+    from app import drive_oauth
 
-    monkeypatch.setattr(config, "JWT_SECRET", "")
-    with pytest.raises(RuntimeError, match="signing secret"):
-        drive_oauth.make_state("org_aaa", "u1", "F1")
+    verifier = drive_oauth.new_code_verifier()
+    challenge = drive_oauth.code_challenge_s256(verifier)
+    # RFC 7636: S256 = BASE64URL(SHA256(verifier)) without padding
+    import base64
+    import hashlib
+
+    expected = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+    assert challenge == expected
