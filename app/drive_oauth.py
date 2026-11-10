@@ -47,16 +47,6 @@ STATE_TTL_SECONDS = 600
 STATE_PURPOSE = "drive_oauth"
 
 
-class OAuthStateError(ValueError):
-    """Raised when an OAuth callback cannot be attributed to a legitimate
-    pending flow. `reason` is a short, safe code for frontend redirects — it
-    never contains the raw token, cookie, exception text, or config values."""
-
-    def __init__(self, reason: str):
-        super().__init__(reason)
-        self.reason = reason
-
-
 def oauth_configured() -> bool:
     """True when the deployment-level OAuth web client is fully configured.
     Read dynamically so patched/env-driven config takes effect per call."""
