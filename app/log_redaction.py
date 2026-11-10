@@ -15,9 +15,13 @@ that any external service has been verified.
 Behavior: callback access records keep method, bare path, HTTP version and
 status; the query string (code/state values) is dropped for the OAuth
 callback route only. Non-callback requests are logged exactly as before.
-Installed from app.server's lifespan so every launch path that runs the
-app is covered. Operational-hygiene control, not an authentication control.
-Test coverage: tests/test_log_redaction.py.
+The genuine Uvicorn access record is sanitized FIELD-WISE (its five-argument
+args tuple stays intact) so uvicorn's AccessFormatter can still unpack it —
+replacing the whole tuple with None would crash the formatter and drop the
+access line. Generic string-shaped access records (Gunicorn-style) keep the
+fallback handling. Installed from app.server's lifespan so every launch path
+that runs the app is covered. Operational-hygiene control, not an
+authentication control. Test coverage: tests/test_log_redaction.py.
 """
 import logging
 import re
@@ -25,6 +29,12 @@ import re
 # The single org-less OAuth callback route (one deployment-wide redirect URI;
 # registered with Google exactly like this).
 OAUTH_CALLBACK_PATH = "/api/v1/connectors/drive/oauth/callback"
+
+# Uvicorn's real access record template (uvicorn.protocols.* logging):
+#   '%s - "%s %s HTTP/%s" %d' % (addr, method, path, version, status)
+# Its AccessFormatter.formatMessage() unpacks record.args as EXACTLY these
+# five values, so the filter must keep the tuple five fields long.
+_UVICORN_ACCESS_MSG = '%s - "%s %s HTTP/%s" %d'
 
 # A request target inside an access record, e.g.:
 #   "GET /api/v1/connectors/drive/oauth/callback?code=X&state=Y HTTP/1.1"
@@ -43,6 +53,29 @@ class CallbackQueryRedactionFilter(logging.Filter):
     are formatted. Records for any other request pass through unchanged."""
 
     def filter(self, record: logging.LogRecord) -> bool:
+        # Uvicorn's genuine access record: structured five-field args that
+        # AccessFormatter.formatMessage() UNPACKS. Sanitize ONLY the
+        # request-target field and keep the tuple intact — narrowing it (or
+        # None-ing it) breaks the formatter and drops the access line. The
+        # template msg carries no raw values, so after this swap nothing
+        # credential-shaped remains anywhere on the record.
+        if (
+            record.msg == _UVICORN_ACCESS_MSG
+            and isinstance(record.args, tuple)
+            and len(record.args) == 5
+            and isinstance(record.args[2], str)
+            and OAUTH_CALLBACK_PATH in record.args[2]
+            and "?" in record.args[2]
+        ):
+            client_addr, method, full_path, http_version, status_code = record.args
+            record.args = (
+                client_addr,
+                method,
+                full_path.split("?", 1)[0],  # bare path, query dropped
+                http_version,
+                status_code,
+            )
+            return True
         try:
             message = record.getMessage()
         except Exception:
@@ -57,7 +90,9 @@ class CallbackQueryRedactionFilter(logging.Filter):
             redacted = re.sub(r'\?(?:[^ "]*) HTTP/', " HTTP/", message)
             redacted = re.sub(r'\?[^"]*', "?", redacted)
         # Replace the record's substance wholesale (plain msg, args dropped)
-        # so no later formatter variant can resurrect the raw values.
+        # so no later formatter variant can resurrect the raw values. These
+        # generic/string-shaped records are NOT Uvicorn's five-field shape —
+        # no downstream formatter relies on unpacking their args.
         record.msg, record.args = redacted, None
         return True
 
