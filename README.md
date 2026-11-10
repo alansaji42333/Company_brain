@@ -181,11 +181,23 @@ python -m app.cli ask "What is the company's remote work policy?"
 uvicorn app.server:app
 ```
 
+> **Access-log privacy (Drive OAuth).** Uvicorn access logs normally record
+> the full request target including query values. The app installs a filter
+> (on startup) so the OAuth callback route,
+> `GET /api/v1/connectors/drive/oauth/callback?...` — whose `code`/`state`
+> carry one-time Google authorization values — is logged **without the query
+> string** (method, path and status retained). This covers the uvicorn and
+> gunicorn launch paths in this repository. If you run a reverse proxy,
+> tunnel or hosting platform in front of the app, configure ITS access
+> format the same way (log no query values for the callback route); those
+> logs are outside the application and are NOT verified by this setting.
+
 Endpoints:
 | Path | Method | Description |
 |---|---|---|
 | `/` | GET | Chat UI |
 | `/skills-page` | GET | Skills admin UI |
+| `/connectors` | GET | Connectors UI (Drive OAuth callback return route) |
 | `/chat` | POST | Send a message (`{"message": "...", "conversation_id": "..."}`) |
 | `/chat/confirm` | POST | Confirm or decline a proposed action (`{"conversation_id": "...", "approved": true/false}`) |
 | `/ingest` | POST | Trigger Drive ingestion |

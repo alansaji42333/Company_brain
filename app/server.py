@@ -96,6 +96,11 @@ def _read_static(filename: str) -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     validate_config()
+    from app.log_redaction import install_callback_query_redaction
+
+    # Access logs must never carry the OAuth callback's code/state query
+    # values (see app/log_redaction.py; README documents reverse-proxy duty).
+    install_callback_query_redaction()
     from app.embeddings import _get_ef
     _get_ef()
 
