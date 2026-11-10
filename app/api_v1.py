@@ -658,15 +658,21 @@ async def drive_oauth_callback(
 
     No Authorization header exists here (Google's redirect) — authorization
     is the server-side pending row bound to this browser:
-      1. row lookup by the state nonce (+ expiry), unknown/expired rejected;
-      2. browser-binding cookie checked (constant-time) BEFORE any consume
-         or token exchange;
-      3. single-use atomic consume (conditional UPDATE, zero rows = reject);
-      4. the initiating user must STILL be an org admin of the row's org;
-      5. code exchange with the row's decrypted PKCE verifier;
-      6. encrypted connector storage + audit, 302 back to the frontend with
+      1. row lookup by the state nonce — unknown rejected WITHOUT clearing
+         the cookie (this browser may hold a newer flow's binding cookie);
+      2. browser-binding cookie checked (constant-time) BEFORE expiry
+         handling, consume, or exchange — a mismatch never clears another
+         (e.g. newer) flow's cookie and never touches tokens;
+      3. expiry: only checked once the binding matches — the cookie belongs
+         to this (dead) transaction, so cleanup is safe;
+      4. single-use atomic consume (conditional UPDATE, zero rows = reject);
+      5. the initiating user must STILL be an org admin of the row's org;
+      6. code exchange with the row's decrypted PKCE verifier;
+      7. encrypted connector storage + audit, 302 back to the frontend with
          only short safe reason codes.
-    The binding cookie is cleared on EVERY terminal outcome.
+    The binding cookie is cleared only on terminal outcomes belonging to the
+    verified browser-bound transaction (success and the failures that pass
+    the binding check) — never on unknown/mismatched/replayed-better flows.
     """
     from fastapi.responses import RedirectResponse
     from sqlalchemy import select
@@ -679,33 +685,58 @@ async def drive_oauth_callback(
     if not drive_oauth.oauth_configured():
         raise _drive_oauth_unavailable_error()
 
-    def _redirect(url: str) -> RedirectResponse:
+    def _redirect(url: str, *, clear: bool) -> RedirectResponse:
+        """Browser redirect. `clear=True` ONLY when the outcome belongs to
+        the verified browser-bound transaction: cleanup must never wipe the
+        cookie of a DIFFERENT (e.g. newer) active flow — see the gate order
+        below."""
         response = RedirectResponse(url, status_code=302)
-        response.delete_cookie(_DRIVE_COOKIE_NAME, path=_DRIVE_COOKIE_PATH)
+        if clear:
+            response.delete_cookie(_DRIVE_COOKIE_NAME, path=_DRIVE_COOKIE_PATH)
         return response
 
-    def _fail(reason: str) -> RedirectResponse:
-        return _redirect(f"{FRONTEND_URL}{_CONNECTORS_PAGE}?drive=error&reason={reason}")
+    def _fail(reason: str, *, clear: bool) -> RedirectResponse:
+        return _redirect(f"{FRONTEND_URL}{_CONNECTORS_PAGE}?drive=error&reason={reason}", clear=clear)
 
     if not code or not state:
-        return _fail("missing_params")
+        # No transaction identified at all — some other active flow's cookie
+        # may still live in this browser; do not touch it.
+        return _fail("missing_params", clear=False)
 
     now = int(time.time())
     row = await db.scalar(select(DriveOAuthPending).where(DriveOAuthPending.nonce_hash == drive_oauth._sha256(state)))
-    if row is None or row.expires_at < now:
-        # Lazy hygiene: drop the expired row if we found one. No exchange,
-        # nothing stored, no cookie check needed (row is not trustworthy).
-        if row is not None:
-            await db.delete(row)
-            await db.commit()
-        return _fail("unknown_state" if row is None else "expired_state")
+    if row is None:
+        # Unknown state (never issued, already pruned, or forged): reject
+        # WITHOUT clearing the cookie — this browser may be mid-way through
+        # a newer flow whose binding cookie must survive.
+        return _fail("unknown_state", clear=False)
 
-    # Initiator-browser binding FIRST (before consume/exchange): the cookie
-    # must carry the browser secret issued at start. Constant-time compare.
+    # Initiator-browser binding check FIRST (before expiry handling and any
+    # consume/exchange): the cookie must carry the browser secret issued at
+    # start, compared constant-time. A mismatch may legitimately be a newer
+    # flow's cookie sitting in this browser — never clear it; also never
+    # exchange, consume, or store anything for an invalid flow.
     cookie_value = request.cookies.get(_DRIVE_COOKIE_NAME)
     if not cookie_value or not drive_oauth.verify_browser_secret(cookie_value, row.browser_secret_hash):
-        logger.warning("Drive OAuth browser check failed for org %s (reason=browser_mismatch)", row.org_id)
-        return _fail("browser_mismatch")
+        logger.warning(
+            "Drive OAuth browser check failed for org %s (reason=browser_mismatch)", row.org_id
+        )
+        return _fail("browser_mismatch", clear=False)
+
+    if row.expires_at < now:
+        # Expired — but the binding DID match, so the cookie in this browser
+        # belongs to this (dead) transaction: safe to clean up. Lazily delete
+        # the expired row too.
+        await db.delete(row)
+        await db.commit()
+        return _fail("expired_state", clear=True)
+
+    # Barrier sits between the pending-row read and the single-use consume so
+    # tests can run two callbacks truly concurrently against one row (None in
+    # production).
+    barrier = drive_oauth._TEST_CONSUME_BARRIER
+    if barrier is not None:
+        await barrier.wait()
 
     # Single-use consume: ONE conditional UPDATE that only fires on a fresh
     # (unconsumed, unexpired) row; zero rows affected = already consumed
@@ -722,7 +753,11 @@ async def drive_oauth_callback(
         .values(consumed_at=now)
     )
     if consume_result.rowcount == 0:
-        return _fail("consumed_state")
+        # Replay of an already-burned flow. The binding was verified, so the
+        # cookie genuinely belonged to this dead transaction — clearing is
+        # safe (any newer flow's cookie belongs to a different row whose
+        # hashes would not match).
+        return _fail("consumed_state", clear=True)
     await db.commit()
 
     # Authorization revalidated AT CALLBACK TIME from the DB: the initiating
@@ -730,7 +765,7 @@ async def drive_oauth_callback(
     membership = await orgs.get_membership(db, row.org_id, row.user_id)
     if membership is None or membership.role != orgs.ROLE_ADMIN:
         logger.warning("Drive OAuth callback revoked: user %s no longer admin of org %s", row.user_id, row.org_id)
-        return _fail("revoked")
+        return _fail("revoked", clear=True)
 
     try:
         # PKCE: the encrypted verifier decrypts ONLY here (in memory).
@@ -740,12 +775,12 @@ async def drive_oauth_callback(
         # Never log raw exception text (token URLs, auth codes etc.) or the
         # verifier — short safe reason only.
         logger.error("Drive OAuth code exchange failed for org %s", row.org_id)
-        return _fail("exchange_failed")
+        return _fail("exchange_failed", clear=True)
 
     if not token_json.get("refresh_token"):
         # Offline access must yield a refresh_token; prompt=consent forces it.
         # A token without one cannot keep working long-term — save nothing.
-        return _fail("no_refresh_token")
+        return _fail("no_refresh_token", clear=True)
 
     config = {
         "folder_id": row.folder_id,
@@ -758,14 +793,14 @@ async def drive_oauth_callback(
         # Safe: config-shape rejection only; the message never contains the
         # token material (see app.connectors._validate).
         logger.error("Drive OAuth callback rejected config for org %s: %s", row.org_id, e)
-        return _fail("invalid_config")
+        return _fail("invalid_config", clear=True)
     await db.commit()
     await audit.record(
         db, row.org_id, row.user_id, audit.ACTION_CONNECTOR_SET, payload={"source": "drive", "via": "oauth"}
     )
     await db.commit()
     logger.info("Drive connector stored via OAuth for org %s user %s", row.org_id, row.user_id)
-    return _redirect(f"{FRONTEND_URL}{_CONNECTORS_PAGE}?drive=connected")
+    return _redirect(f"{FRONTEND_URL}{_CONNECTORS_PAGE}?drive=connected", clear=True)
 
 
 @router.delete("/orgs/{org_id}/connectors/{source}")

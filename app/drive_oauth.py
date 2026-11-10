@@ -46,6 +46,12 @@ STATE_TTL_SECONDS = 600
 # deleted by the callback path.
 STATE_PURPOSE = "drive_oauth"
 
+# Tests-only hook: when set (an asyncio.Barrier — Python 3.13+), the
+# callback waits on it between the pending-row read and the single-use
+# consume, letting a test run multiple callbacks that contend for the SAME
+# row's conditional UPDATE. Always None in production.
+_TEST_CONSUME_BARRIER = None
+
 
 def oauth_configured() -> bool:
     """True when the deployment-level OAuth web client is fully configured.

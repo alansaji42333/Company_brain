@@ -425,14 +425,17 @@ def test_callback_replay_rejected_second_attempt(oauth_env, exchange_spy):
 def test_callback_unknown_state_rejected(oauth_env, exchange_spy):
     client, session_factory = oauth_env
     org = asyncio.run(_seed_org(session_factory, "admin1"))
-    _start(client, org)  # irrelevant row exists
+    _start(client, org)  # an unrelated row exists
 
     res = _callback(client, "never-issued-nonce")
     assert "drive=error&reason=unknown_state" in res.headers["location"]
     assert exchange_spy["codes"] == []
     assert asyncio.run(_connectors_rows(session_factory, org)) == []
-    # cookie cleared even on this error path (the browser may hold one)
-    assert "Max-Age=0" in _cookie_of(res)
+    # NOT cleared: the browser may be mid-way through a newer flow whose
+    # binding cookie must survive (top policy in api_v1).
+    for header in res.headers.get_list("set-cookie"):
+        assert COOKIE_NAME not in header
+    assert client.cookies.get(COOKIE_NAME)  # jar untouched
 
 
 def test_callback_expired_state_rejected_and_row_deleted(oauth_env, exchange_spy):
@@ -479,18 +482,60 @@ def test_callback_role_revoked_between_start_and_callback(oauth_env, exchange_sp
     assert asyncio.run(_connectors_rows(session_factory, org)) == []
 
 
-def test_callback_exchange_failure_redirects_error_and_clears_cookie(oauth_env, exchange_spy):
+def test_callback_exchange_failure_redirects_error_and_clears_cookie(oauth_env, exchange_spy, caplog):
+    """Exchange failure: nothing stored, cookie cleared, and NO secret-shaped
+    material (authorization code, state nonce, PKCE verifier, browser cookie)
+    anywhere in the redirect Location, response body, or any log record."""
+    import logging
+
     client, session_factory = oauth_env
     org = asyncio.run(_seed_org(session_factory, "admin1"))
     start = _start(client, org)
     state = _state_of(start.json()["authorize_url"])
+    cookie_value = client.cookies.get(COOKIE_NAME)
+    fake_code = "dummy-one-time-code-marker"
+
+    async def _swap_verifier():
+        from app import connectors
+        from app.database import DriveOAuthPending
+
+        async with session_factory() as db:
+            row = (await db.execute(select(DriveOAuthPending))).scalars().one()
+            row.code_verifier_encrypted = connectors.encrypt_secret_string("dummy-pkce-verifier-marker")
+            await db.commit()
+
+    asyncio.run(_swap_verifier())
     exchange_spy["raise"] = RuntimeError("grant_invalid with sensitive token userinfo")
 
-    res = _callback(client, state)
+    with caplog.at_level(logging.DEBUG):
+        res = _callback(client, state, code=fake_code)
     assert res.status_code == 302
-    assert res.headers["location"] == f"{CONNECTORS_PAGE}?drive=error&reason=exchange_failed"
-    # no raw exception text in the redirect
-    assert "grant_invalid" not in res.headers["location"]
+    location = res.headers["location"]
+    assert location == f"{CONNECTORS_PAGE}?drive=error&reason=exchange_failed"
+    assert res.text == ""
+
+    # The terminating exchange never saw a valid code marker echo; assert the
+    # dummy code, the raw state nonce, the stored verifier, and the binding
+    # cookie value appear NOWHERE in redirect, body, or any APP/server access
+    # log record. (httpx's own client-side request logging in the test
+    # transport is excluded — it is not the application's, uvicorn's or
+    # gunicorn's log; the real access log is smoke-tested in
+    # tests/test_log_redaction.py + the production-server smoke check.)
+    server_loggers = ("app.", "uvicorn", "gunicorn")
+
+    def _log_records():
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if any(r.name.startswith(prefix) for prefix in server_loggers)
+        ]
+
+    for marker in (fake_code, state, "dummy-pkce-verifier-marker", cookie_value or ""):
+        assert marker and marker not in location
+        assert marker not in res.text
+        assert not any(marker in message for message in _log_records())
+    # No raw exception text in the redirect/logs either.
+    assert "grant_invalid" not in location
     assert asyncio.run(_connectors_rows(session_factory, org)) == []
     assert "Max-Age=0" in _cookie_of(res)
     # flow burned even though the exchange failed (single-use durability)
@@ -530,6 +575,147 @@ def test_callback_still_503_when_oauth_unconfigured(oauth_env, exchange_spy, mon
     monkeypatch.setattr(config, "GOOGLE_OAUTH_REDIRECT_URI", "")
     res = _callback(client, state)
     assert res.status_code == 503
+
+
+# --- overlapping flows / concurrency ---------------------------------------------
+
+def test_return_to_abandoned_flow_keeps_newer_flows_cookie_then_newer_flow_completes(
+    oauth_env, exchange_spy
+):
+    """Full sequence: start A, start B, return through A (rejected, browser
+    binding is B's cookie now), return through B (succeeds). A's generic
+    reject must NOT clear B's cookie; B completes with exactly one exchange
+    under B's org/folder."""
+    client, session_factory = oauth_env
+    org = asyncio.run(_seed_org(session_factory, "admin1"))
+    start_a = _start(client, org, folder_id="F-123")
+    state_a = _state_of(start_a.json()["authorize_url"])
+    start_b = _start(client, org, folder_id="F-456")
+    state_b = _state_of(start_b.json()["authorize_url"])
+    cookie_b = client.cookies.get(COOKIE_NAME)  # jar now holds B's secret
+    assert cookie_b
+
+    # Return through A: the browser carries only B's cookie → binding check
+    # fails for A's row. Rejected with NO exchange, nothing stored, and
+    # crucially NO cookie clear (B's active flow survives).
+    res_a = _callback(client, state_a)
+    assert res_a.status_code == 302
+    assert "drive=error&reason=browser_mismatch" in res_a.headers["location"]
+    assert exchange_spy["codes"] == []
+    assert not any(
+        COOKIE_NAME in header for header in res_a.headers.get_list("set-cookie")
+    ), "the abandoned flow's rejection must not touch the active flow's cookie"
+    assert client.cookies.get(COOKIE_NAME) == cookie_b
+    assert asyncio.run(_connectors_rows(session_factory, org)) == []
+
+    # Return through B: completes normally — exactly one exchange, connector
+    # stored with B's row org + folder, and A's flow becomes irrelevant.
+    res_b = _callback(client, state_b)
+    assert res_b.status_code == 302
+    assert res_b.headers["location"].endswith("drive=connected")
+    assert exchange_spy["codes"] == ["4/valid-auth-code"]
+
+    async def _get():
+        from app import connectors
+
+        async with session_factory() as db:
+            return await connectors.get_connector(db, org, "drive")
+
+    stored = asyncio.run(_get())
+    assert stored["folder_id"] == "F-456"
+    consumed = [r for r in asyncio.run(_pending_rows(session_factory)) if r.consumed_at is not None]
+    assert len(consumed) == 1 and consumed[0].folder_id == "F-456"
+
+
+def test_simultaneous_callbacks_single_consume_and_safe_loser(oauth_env, exchange_spy):
+    """Durable two-party race: two callbacks with separate DB sessions and a
+    barrier AFTER both pending-row reads, contending for the SAME row's
+    conditional consume UPDATE. (SQLite deterministic-enough by pysqlite
+    autocommit reads; this does NOT prove Postgres behavior — see report.)"""
+    import httpx
+    from fastapi.testclient import TestClient  # noqa: F401
+
+    from app import drive_oauth
+    from app.server import app
+
+    client, session_factory = oauth_env
+    org = asyncio.run(_seed_org(session_factory, "admin1"))
+    start = _start(client, org)
+    state = _state_of(start.json()["authorize_url"])
+    cookie_value = client.cookies.get(COOKIE_NAME)
+
+    class TwoPartyBarrier:
+        """asyncio.Barrier equivalent (Python 3.11 CI has no asyncio.Barrier)."""
+
+        def __init__(self, parties: int):
+            self._parties = parties
+            self._count = 0
+            self._release = asyncio.Event()
+
+        async def wait(self):
+            self._count += 1
+            if self._count >= self._parties:
+                self._release.set()
+            await self._release.wait()
+
+    barrier = TwoPartyBarrier(2)
+    drive_oauth._TEST_CONSUME_BARRIER = barrier
+    try:
+        async def one_callback(code: str):
+            # Each call gets its own connection from the app's session pool.
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="https://testserver") as ac:
+                return await ac.get(
+                    CALLBACK_PATH,
+                    params={"code": code, "state": state},
+                    headers={"Cookie": f"{COOKIE_NAME}={cookie_value}"},
+                )
+
+        async def run_race():
+            return await asyncio.gather(
+                one_callback("4/race-code-A"), one_callback("4/race-code-B")
+            )
+
+        responses = asyncio.run(run_race())
+    finally:
+        drive_oauth._TEST_CONSUME_BARRIER = None
+
+    statuses = sorted({r.headers["location"] for r in responses})
+    assert len(statuses) == 2
+    # sorted: "...drive=connected..." sorts before "...drive=error..."
+    (success_url, error_url) = statuses
+    assert success_url.endswith("drive=connected")
+    assert "drive=error&reason=consumed_state" in error_url  # safe loser
+    # winner's code was exchanged EXACTLY once; the loser's never
+    assert len(exchange_spy["codes"]) == 1
+    assert exchange_spy["codes"][0] in ("4/race-code-A", "4/race-code-B")
+
+    rows = asyncio.run(_connectors_rows(session_factory, org))
+    assert len(rows) == 1
+
+    from app import audit
+    from app.database import AuditLog
+
+    from app.database import AuditLog, DriveOAuthPending
+
+    async def _counts():
+        from sqlalchemy import func, select as _select
+
+        async with session_factory() as db:
+            conn_set = (
+                await db.execute(
+                    _select(func.count()).select_from(AuditLog).where(
+                        AuditLog.action_type == audit.ACTION_CONNECTOR_SET
+                    )
+                )
+            ).scalar_one()
+            pendings = list((await db.execute(_select(DriveOAuthPending))).scalars().all())
+            return conn_set, pendings
+
+    set_count, pendings = asyncio.run(_counts())
+    assert set_count == 1
+    consumed = [r for r in pendings if r.consumed_at is not None]
+    assert len(consumed) == 1 and consumed[0].folder_id == "F-123" and consumed[0].org_id == org
 
 
 # --- drive_oauth unit contract ---------------------------------------------------
