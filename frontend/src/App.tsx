@@ -178,7 +178,12 @@ function Shell({
   onSignOut: () => void;
   activeOrgKey?: string;
 }) {
-  const [page, setPage] = useState<Page>("chat");
+  const [page, setPage] = useState<Page>(
+    // Deep-link init: the Drive OAuth callback returns the browser to
+    // /connectors?drive=... and the backend serves the SPA shell at that
+    // route, so navigation starts there instead of defaulting to chat.
+    window.location.pathname === "/connectors" ? "connectors" : "chat",
+  );
   return (
     <div style={{ maxWidth: 960, margin: "0 auto", padding: 20 }}>
       <nav style={{ marginBottom: 20, display: "flex", gap: 16, alignItems: "center" }}>

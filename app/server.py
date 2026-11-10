@@ -150,6 +150,17 @@ def skills_page():
     return index()
 
 
+@app.get("/connectors", response_class=HTMLResponse)
+def connectors_page():
+    """SPA shell at the exact OAuth return route.
+
+    Drive OAuth callbacks 302 to `FRONTEND_URL/connectors?drive=connected`
+    (or ?drive=error&reason=...), so the backend must serve the SPA at that
+    precise path. No catch-all here: unknown API paths keep their 404s.
+    """
+    return index()
+
+
 # --- backwards-compatible root API routes (proxy to v1) ------------------
 # Kept so existing clients / vanilla JS UIs keep working during the
 # migration to the versioned /api/v1 endpoints.
