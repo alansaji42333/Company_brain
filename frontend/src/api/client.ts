@@ -320,6 +320,18 @@ export const api = {
       `/orgs/${encodeURIComponent(orgId)}/connectors/${source}`,
       { method: "DELETE" },
     ),
+  // Slack test-and-list (admin only): validates the bot token against Slack
+  // and returns the workspace's channels (id + name). Stores nothing.
+  testSlackConnector: (orgId: string, botToken: string) =>
+    request<{ ok: true; workspace: string; channels: { id: string; name: string }[] }>(
+      `/orgs/${encodeURIComponent(orgId)}/connectors/slack/test`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ bot_token: botToken }),
+      },
+    ),
+
   // Drive OAuth (self-serve): authenticated start returns the Google
   // authorize URL (the browser then navigates there) — this goes through the
   // api client because the start endpoint needs the Bearer token.

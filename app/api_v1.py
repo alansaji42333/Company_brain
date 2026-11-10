@@ -120,6 +120,11 @@ class DriveConnectorRequest(BaseModel):
     token_json: dict
 
 
+
+class SlackTestRequest(BaseModel):
+    bot_token: str
+
+
 # --- routes --------------------------------------------------------------
 
 @router.post("/synthesize")
@@ -452,6 +457,67 @@ async def put_slack_connector(
     await audit.record(db, org_id, ctx.user_id, audit.ACTION_CONNECTOR_SET, payload={"source": "slack"})
     await db.commit()
     return {"org_id": org_id, "source": "slack", "configured": True}
+
+
+@router.post("/orgs/{org_id}/connectors/slack/test")
+async def test_slack_connector(
+    org_id: str,
+    req: SlackTestRequest,
+    db: AsyncSession = Depends(get_db),
+    ctx: AuthContext = Depends(require_admin),
+):
+    """Validate a Slack bot token and list the workspace's channels.
+
+    Admin + membership only. STORES NOTHING — this is a try-before-save
+    helper: it calls Slack's auth.test + conversations.list with the pasted
+    token and returns channel id + name. The token is never logged, never
+    stored, and never echoed back (not in errors either). Slack client is
+    constructed here so tests can fake it.
+    """
+    _require_member_of(ctx, org_id)
+    org = await get_organization(db, org_id)
+    if org is None:
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    from slack_sdk import WebClient
+    from slack_sdk.errors import SlackApiError
+
+    # Token deliberately NOT logged anywhere in this block; SlackApiError
+    # strings never carry the token, but error text is mapped to safe
+    # messages regardless.
+    client = WebClient(token=req.bot_token)
+    try:
+        auth = client.auth_test()
+        channels: list[dict] = []
+        cursor: str | None = None
+        while True:
+            kwargs: dict = {"limit": 200, "types": "public_channel,private_channel", "exclude_archived": True}
+            if cursor:
+                kwargs["cursor"] = cursor
+            page = client.conversations_list(**kwargs)
+            for ch in page.get("channels") or []:
+                channels.append({"id": ch["id"], "name": ch["name"]})
+            cursor = (page.get("response_metadata") or {}).get("next_cursor") or None
+            if not cursor or len(channels) >= 1000:
+                break
+    except SlackApiError as e:
+        # Safe, short reason from Slack's error code (e.g. "invalid_auth");
+        # never the token.
+        code = (e.response.get("error") or "") if e.response is not None else ""
+        safe_messages = {
+            "invalid_auth": "Slack rejected this bot token (invalid or revoked).",
+            "not_authed": "Bot token missing or not authorized.",
+        }
+        message = safe_messages.get(code)
+        if message is None:
+            logger.warning("Slack test token failed for org %s (code=%s)", org_id, code or "unknown")
+            message = "Could not talk to Slack with this token. Make sure the bot has channels:read."
+        raise HTTPException(status_code=400, detail=message) from None
+    except Exception:
+        logger.warning("Slack test token failed for org %s", org_id)
+        raise HTTPException(status_code=400, detail="Could not reach Slack. Try again.") from None
+
+    return {"ok": True, "workspace": auth.get("team"), "channels": channels}
 
 
 @router.put("/orgs/{org_id}/connectors/drive")

@@ -200,6 +200,8 @@ function SlackCard(
   const [channels, setChannels] = useState("");
   const [saving, setSaving] = useState(false);
   const [sync, setSync] = useState<SyncState | null>(null);
+  const [testing, setTesting] = useState(false);
+  const [channelList, setChannelList] = useState<{ id: string; name: string }[] | null>(null);
 
   // The connector list loads async — seed the channel field when it arrives
   // (and on re-save/reload), but never overwrite while the admin is typing
@@ -236,6 +238,30 @@ function SlackCard(
     }
   };
 
+  const testAndList = async () => {
+    // Validates the pasted bot token against Slack (auth.test +
+    // conversations.list) and lists the channels so the admin can click
+    // instead of typing IDs. The backend stores nothing, never logs or
+    // echoes the token.
+    setTesting(true);
+    try {
+      const res = await api.testSlackConnector(orgId, botToken.trim());
+      setChannelList(res.channels);
+      if (res.channels.length === 0) onError("Token is valid but the bot is not in any channels yet — invite it to channels in Slack.");
+    } catch (e: unknown) {
+      setChannelList(null);
+      onError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const toggleChannel = (id: string) => {
+    const ids = currentChannelIds(channels);
+    const next = ids.includes(id) ? ids.filter((c) => c !== id) : [...ids, id];
+    setChannels(next.join(", "));
+  };
+
   return (
     <section style={card}>
       <h3 style={cardTitle}>Slack</h3>
@@ -261,12 +287,47 @@ function SlackCard(
           />
           <br />
           <button
+            onClick={testAndList}
+            disabled={!botToken.trim() || testing}
+            style={{ padding: 8, background: "#eee", border: "1px solid #ddd", borderRadius: 6, marginBottom: 8, marginRight: 8 }}
+          >
+            {testing ? "Talking to Slack…" : "Test and list channels"}
+          </button>
+          <button
             onClick={save}
             disabled={!botToken.trim() || saving || currentChannelIds(channels).length === 0}
             style={{ padding: 8, background: "#007aff", color: "#fff", border: "none", borderRadius: 6, marginBottom: 8 }}
           >
             {saving ? "Saving…" : connected ? "Update Slack connection" : "Connect Slack"}
           </button>
+          {channelList && (
+            <div style={{ marginTop: 8 }}>
+              <p style={{ color: "#666", fontSize: 13 }}>Click channels to include; selected ones appear above:</p>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                {channelList.map((c) => {
+                  const selected = currentChannelIds(channels).includes(c.id);
+                  return (
+                    <button
+                      key={c.id}
+                      onClick={() => toggleChannel(c.id)}
+                      title={`${c.id} — click to ${selected ? "remove" : "add"}`}
+                      style={{
+                        padding: "4px 10px",
+                        fontSize: 13,
+                        borderRadius: 14,
+                        border: "1px solid",
+                        borderColor: selected ? "#007aff" : "#ccc",
+                        background: selected ? "#e5f1ff" : "#fff",
+                        color: "#111",
+                      }}
+                    >
+                      #{c.name}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
         </div>
       )}
       {!isAdmin && connected && <p style={{ color: "#888", fontSize: 13 }}>Only org admins can change this connection.</p>}

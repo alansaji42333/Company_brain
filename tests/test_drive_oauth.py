@@ -12,8 +12,11 @@ Covers:
   atomic consume (replay → consumed_state); DB role revalidation (revoked
   admins rejected); encrypted connector storage audited to the ROW's user;
   cookie cleared on every terminal outcome; only short safe reason codes.
+- Slack test-and-list endpoint (Slack SDK faked): channels for a valid
+  token, clear error for an invalid one, admin required, nothing stored.
 """
 import asyncio
+from typing import ClassVar
 
 import pytest
 import pytest_asyncio
@@ -553,3 +556,116 @@ def test_pkce_verifier_and_challenge_contract():
 
     expected = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
     assert challenge == expected
+
+
+# --- Slack test-and-list endpoint -------------------------------------------------
+
+
+class _FakeSlackResponse:
+    """Dict-shaped stand-in for SlackResponse (the endpoint only .gets)."""
+
+    def __init__(self, data: dict):
+        self._data = data
+
+    def get(self, key, default=None):
+        return self._data.get(key, default)
+
+
+class _FakeSlackWebClient:
+    """Stands in for slack_sdk.WebClient (patched in slack_sdk, which the
+    endpoint imports at call time). auth.test + paginated conversations.list.
+    Tokens in tests are obvious throwaways."""
+
+    instances: ClassVar[list] = []
+
+    def __init__(self, token: str, **kwargs):
+        self.token = token
+        _FakeSlackWebClient.instances.append(self)
+        self._list_calls: list[dict] = []
+
+    def _raise_invalid_auth(self):
+        from slack_sdk.errors import SlackApiError
+
+        raise SlackApiError(message="auth failed", response=_FakeSlackResponse({"error": "invalid_auth"}))
+
+    def auth_test(self):
+        if self.token == "xoxb-throws":
+            raise RuntimeError("connection error")
+        if not self.token.startswith("xoxb-valid"):
+            self._raise_invalid_auth()
+        return {"team": "Acme Workspace", "user": "bot"}
+
+    def conversations_list(self, **kwargs):
+        self._list_calls.append(kwargs)
+        if not self.token.startswith("xoxb-valid"):
+            self._raise_invalid_auth()
+        pages = {
+            None: {"channels": [{"id": "C1", "name": "general"}, {"id": "C2", "name": "eng"}],
+                   "response_metadata": {"next_cursor": "next-cursor"}},
+            "next-cursor": {"channels": [{"id": "C3", "name": "sales"}], "response_metadata": {"next_cursor": ""}},
+        }
+        return pages.get(kwargs.get("cursor"), {"channels": [], "response_metadata": {"next_cursor": ""}})
+
+
+@pytest.fixture
+def fake_slack(monkeypatch):
+    _FakeSlackWebClient.instances = []
+    # The endpoint imports WebClient at call time via `from slack_sdk import
+    # WebClient`, so patch slack_sdk itself.
+    import slack_sdk
+
+    monkeypatch.setattr(slack_sdk, "WebClient", _FakeSlackWebClient)
+    return _FakeSlackWebClient
+
+
+def test_slack_test_returns_channels_from_pagination(oauth_env, fake_slack):
+    client, session_factory = oauth_env
+    org = asyncio.run(_seed_org(session_factory, "admin1"))
+    res = client.post(
+        f"/api/v1/orgs/{org}/connectors/slack/test",
+        json={"bot_token": "xoxb-valid-token-1"},
+        headers={"Authorization": f"Bearer {_token('admin1', org)}"},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["ok"] is True and body["workspace"] == "Acme Workspace"
+    assert body["channels"] == [
+        {"id": "C1", "name": "general"},
+        {"id": "C2", "name": "eng"},
+        {"id": "C3", "name": "sales"},
+    ]
+    # paginated (2 pages), token never echoed back
+    assert len(fake_slack.instances) == 1
+    assert len(fake_slack.instances[0]._list_calls) == 2
+    assert "xoxb" not in res.text
+    # stored nothing
+    assert asyncio.run(_connectors_rows(session_factory, org)) == []
+
+
+def test_slack_test_invalid_token_clear_error(oauth_env, fake_slack):
+    client, session_factory = oauth_env
+    org = asyncio.run(_seed_org(session_factory, "admin1"))
+    res = client.post(
+        f"/api/v1/orgs/{org}/connectors/slack/test",
+        json={"bot_token": "xoxb-totally-bogus"},
+        headers={"Authorization": f"Bearer {_token('admin1', org)}"},
+    )
+    assert res.status_code == 400
+    detail = res.json()["detail"]
+    assert "rejected this bot token" in detail
+    # the token itself is never in the error
+    assert "bogus" not in detail
+    # Slack never saw a second call (auth.test failed first)
+    assert fake_slack.instances[0]._list_calls == []
+
+
+def test_slack_test_requires_admin(oauth_env, fake_slack):
+    client, session_factory = oauth_env
+    org = asyncio.run(_seed_org(session_factory, "admin1", extra_member="peon", extra_role="member"))
+    res = client.post(
+        f"/api/v1/orgs/{org}/connectors/slack/test",
+        json={"bot_token": "xoxb-valid-token-1"},
+        headers={"Authorization": f"Bearer {_token('peon', org)}"},
+    )
+    assert res.status_code == 403
+    assert fake_slack.instances == []
