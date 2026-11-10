@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { useAuth0 } from "@auth0/auth0-react";
 import ChatPage from "./pages/ChatPage";
 import SkillsPage from "./pages/SkillsPage";
+import ConnectorsPage from "./pages/ConnectorsPage";
 import {
   api,
   getActiveOrgId,
@@ -12,7 +13,7 @@ import {
 } from "./api/client";
 import { AUTH0_CONFIGURED } from "./auth/config";
 
-type Page = "chat" | "skills";
+type Page = "chat" | "skills" | "connectors";
 
 export default function App() {
   // Stable mode split: the Auth0 tree and the dev (paste-token) tree never
@@ -185,6 +186,9 @@ function Shell({
         <button onClick={() => setPage("chat")} style={navBtn(page === "chat")}>Chat</button>
         <button onClick={() => setPage("skills")} style={navBtn(page === "skills")}>Skills</button>
         {me && (
+          <button onClick={() => setPage("connectors")} style={navBtn(page === "connectors")}>Connectors</button>
+        )}
+        {me && (
           <span style={{ color: "#666", fontSize: 14 }}>
             {me.name} · {me.role}
           </span>
@@ -211,7 +215,13 @@ function Shell({
         </button>
       </nav>
       <div key={activeOrgKey}>
-        {page === "chat" ? <ChatPage /> : <SkillsPage />}
+        {page === "chat" ? (
+          <ChatPage />
+        ) : page === "connectors" && me ? (
+          <ConnectorsPage me={me} />
+        ) : (
+          <SkillsPage />
+        )}
       </div>
     </div>
   );

@@ -80,6 +80,16 @@ export interface MyOrgSummary {
   role: string;
 }
 
+/** Non-secret view from GET /orgs/{org_id}/connectors (no tokens/secrets). */
+export interface ConnectorView {
+  source: "slack" | "drive";
+  configured: true;
+  channel_ids?: string[];
+  folder_id?: string;
+  updated_at?: string;
+  updated_by?: string;
+}
+
 export interface ToolProposal {
   type: "tool_proposal";
   tool_id: string;
@@ -107,6 +117,8 @@ export interface ChatStreamHandlers {
 }
 
 const API_BASE = "/api/v1";
+// The async ingest queue + job status live under /api (outside /api/v1).
+const INGEST_BASE = "/api";
 
 // --- auth plumbing -----------------------------------------------------------
 // The access token comes from a registered getter — Auth0's
@@ -150,15 +162,18 @@ function extraHeaders(extra: HeadersInit | undefined): Record<string, string> {
   return { ...((extra as Record<string, string>) || {}) };
 }
 
-async function requestOnce(path: string, init: RequestInit, tokenValue: string, orgValue: string): Promise<Response> {
+async function requestOnce(base: string, path: string, init: RequestInit, tokenValue: string): Promise<Response> {
   const headers = extraHeaders(init.headers);
   headers.Authorization = `Bearer ${tokenValue}`;
-  if (orgValue) headers["X-Org-Id"] = orgValue;
-  return fetch(`${API_BASE}${path}`, { ...init, headers });
+  if (activeOrgId) headers["X-Org-Id"] = activeOrgId;
+  return fetch(`${base}${path}`, { ...init, headers });
 }
 
-async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
-  let res = await requestOnce(path, init, await tokenGetter(), activeOrgId);
+const REQUEST_BASES = { v1: API_BASE, ingest: INGEST_BASE } as const;
+type RequestBase = keyof typeof REQUEST_BASES;
+
+async function requestVia<T>(base: RequestBase, path: string, init: RequestInit): Promise<T> {
+  let res = await requestOnce(REQUEST_BASES[base], path, init, await tokenGetter());
   if (res.status === 401) {
     // One silent re-auth retry with a forcibly refreshed token. If that
     // still gets a 401 the session is unusable — hand the user to the
@@ -166,7 +181,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     let refreshed = false;
     try {
       await tokenGetter(true);
-      res = await requestOnce(path, init, await tokenGetter(), activeOrgId);
+      res = await requestOnce(REQUEST_BASES[base], path, init, await tokenGetter());
       refreshed = res.status !== 401;
     } catch {
       refreshed = false;
@@ -178,6 +193,16 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     throw new Error(detail || `Request failed: ${res.status}`);
   }
   return res.json() as Promise<T>;
+}
+
+async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  return requestVia<T>("v1", path, init);
+}
+
+// Same auth plumbing as request(), but for routes outside /api/v1 (the
+// async ingest queue + job status live under /api).
+async function ingestRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
+  return requestVia<T>("ingest", path, init);
 }
 
 export const api = {
@@ -258,20 +283,43 @@ export const api = {
     ws.send(JSON.stringify({ action: "tool_confirm", conversation_id: conversationId, tool_id: toolId, approved })),
 
   // Ingestion
+  // The async ingest endpoints live under /api (NOT /api/v1): they enqueue
+  // ARQ jobs and return {job_id}; poll /api/ingest/status/{job_id}.
   ingestDrive: (folderId?: string) =>
-    request<IngestResponse>(`/ingest${folderId ? `?folder_id=${folderId}` : ""}`, { method: "POST" }),
-  ingestSlack: () => request<IngestResponse>("/ingest/slack", { method: "POST" }),
+    ingestRequest<IngestResponse>(`/ingest/drive${folderId ? `?folder_id=${encodeURIComponent(folderId)}` : ""}`, { method: "POST" }),
+  ingestSlack: () => ingestRequest<IngestResponse>("/ingest/slack", { method: "POST" }),
   ingestAsync: (source: "drive" | "slack", folderId?: string) =>
-    request<IngestResponse>(`/ingest/async?source=${source}${folderId ? `&folder_id=${folderId}` : ""}`, {
+    ingestRequest<IngestResponse>(`/ingest/${source}${folderId ? `?folder_id=${encodeURIComponent(folderId)}` : ""}`, {
       method: "POST",
     }),
+  getJob: (jobId: string) =>
+    ingestRequest<{ job_id: string; status: string; result: Record<string, unknown> | null }>(
+      `/ingest/status/${encodeURIComponent(jobId)}`,
+    ),
 
   // Synthesis
   synthesize: () => request<SynthesisResponse>("/synthesize", { method: "POST" }),
   synthesizeAsync: () => request<IngestResponse>("/synthesize/async", { method: "POST" }),
 
-  // Jobs
-  getJob: (jobId: string) => request<Record<string, unknown>>(`/jobs/${jobId}`),
+  // Connectors (org-scoped, non-secret reads for any member; writes admin-only)
+  listOrgConnectors: (orgId: string) =>
+    request<{ org_id: string; connectors: ConnectorView[] }>(
+      `/orgs/${encodeURIComponent(orgId)}/connectors`,
+    ),
+  putSlackConnector: (orgId: string, botToken: string, channelIds: string[]) =>
+    request<{ org_id: string; source: string; configured: boolean }>(
+      `/orgs/${encodeURIComponent(orgId)}/connectors/slack`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ bot_token: botToken, channel_ids: channelIds }),
+      },
+    ),
+  deleteOrgConnector: (orgId: string, source: "slack" | "drive") =>
+    request<{ org_id: string; source: string; removed: true }>(
+      `/orgs/${encodeURIComponent(orgId)}/connectors/${source}`,
+      { method: "DELETE" },
+    ),
 
   // Skills
   listSkills: () => request<{ skills: SkillSummary[] }>("/skills"),
